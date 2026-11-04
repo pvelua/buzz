@@ -327,6 +327,99 @@ impl SkillMd {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// B2 item 7 (D20): what the harness DOES about a fetch outcome.
+//
+// Separated from both the transport and the writer because this is the part
+// most likely to be got wrong quietly, and the only part that can be decided
+// without any I/O. The trap is finding 3 of §8.1: `no_skill_assigned` and
+// `skills_disabled` are RESULTS, not errors. A harness that treats either as a
+// failure puts a perfectly healthy agent into degraded mode and announces it in
+// a channel -- noise that looks exactly like a real outage.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `get_assigned_skill`'s answer, reduced to the cases that change behaviour.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FetchOutcome {
+    /// `status: "assigned"` with a `skill_md` payload.
+    Assigned,
+    /// `status: "no_skill_assigned"` — a result. Nothing is wrong.
+    NoSkillAssigned,
+    /// `status: "skills_disabled"` — the feature is off *on purpose*.
+    SkillsDisabled,
+    /// Transport failure, or a coded error such as `[project_not_found]`.
+    Failed(String),
+}
+
+/// What the harness should do about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HarnessAction {
+    /// Write the directory and carry on.
+    InstallSkill,
+    /// Start the session normally and say nothing.
+    StartNormally,
+    /// Try again after a delay; the fetch has not had its chances yet.
+    Retry { attempt: u32, delay_secs: u64 },
+    /// Start, but announce in-channel that the assigned skill is unavailable
+    /// and why, and raise an alert.
+    DegradedMode { reason: String },
+    /// `require_assigned_skill` is set and we have no skill: take no tasks,
+    /// and **do not exit** — D20 is explicit that the agent stays up.
+    RefuseTasks { reason: String },
+}
+
+/// Exponential backoff, capped. Deliberately small and total: a fetch at
+/// session birth must not hold a turn open for minutes.
+pub const FETCH_MAX_ATTEMPTS: u32 = 3;
+
+fn backoff_secs(attempt: u32) -> u64 {
+    match attempt {
+        0 => 1,
+        1 => 4,
+        _ => 10,
+    }
+}
+
+/// Decide, given the outcome, the project's `require_assigned_skill`, and how
+/// many attempts have already been made.
+pub fn decide(outcome: &FetchOutcome, require_assigned_skill: bool, attempts: u32) -> HarnessAction {
+    match outcome {
+        FetchOutcome::Assigned => HarnessAction::InstallSkill,
+
+        // The feature being off outranks `require_assigned_skill`: requiring an
+        // assigned skill in a project where skills are disabled is a
+        // contradiction, and resolving it by refusing every task would take the
+        // agent down for a setting someone turned off deliberately. Start, and
+        // say nothing -- the contract's own instruction.
+        FetchOutcome::SkillsDisabled => HarnessAction::StartNormally,
+
+        // A result, not a failure. Nothing to retry and nothing to announce --
+        // unless the project insists on a skill, which is what the setting is
+        // for.
+        FetchOutcome::NoSkillAssigned => {
+            if require_assigned_skill {
+                HarnessAction::RefuseTasks {
+                    reason: "no skill is assigned and this project sets require_assigned_skill".into(),
+                }
+            } else {
+                HarnessAction::StartNormally
+            }
+        }
+
+        FetchOutcome::Failed(reason) => {
+            if attempts < FETCH_MAX_ATTEMPTS {
+                HarnessAction::Retry { attempt: attempts, delay_secs: backoff_secs(attempts) }
+            } else if require_assigned_skill {
+                HarnessAction::RefuseTasks {
+                    reason: format!("could not fetch the assigned skill ({reason}); require_assigned_skill is set"),
+                }
+            } else {
+                HarnessAction::DegradedMode { reason: reason.clone() }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,6 +452,75 @@ mod tests {
             fs::write(p.join(ROOT_FILE), format!("---\nname: {s}\n---\n")).unwrap();
         }
         dir
+    }
+
+    // ── item 7: the decision, where finding 3 would be got wrong ────────────
+
+    #[test]
+    fn an_assigned_skill_is_installed() {
+        assert_eq!(decide(&FetchOutcome::Assigned, false, 0), HarnessAction::InstallSkill);
+        assert_eq!(decide(&FetchOutcome::Assigned, true, 0), HarnessAction::InstallSkill);
+    }
+
+    #[test]
+    fn no_skill_assigned_is_not_a_failure() {
+        // The trap: it is a RESULT. Degrading here would announce an outage in a
+        // channel for an agent that is working perfectly.
+        assert_eq!(decide(&FetchOutcome::NoSkillAssigned, false, 0), HarnessAction::StartNormally);
+    }
+
+    #[test]
+    fn skills_disabled_is_silent_even_when_a_skill_is_required() {
+        // The feature is off deliberately; refusing every task because of a
+        // setting someone switched off would take the agent down for no fault.
+        assert_eq!(decide(&FetchOutcome::SkillsDisabled, false, 0), HarnessAction::StartNormally);
+        assert_eq!(decide(&FetchOutcome::SkillsDisabled, true, 0), HarnessAction::StartNormally);
+    }
+
+    #[test]
+    fn require_assigned_skill_refuses_tasks_without_exiting() {
+        match decide(&FetchOutcome::NoSkillAssigned, true, 0) {
+            HarnessAction::RefuseTasks { reason } => {
+                assert!(reason.contains("require_assigned_skill"), "reason must name the setting");
+            }
+            other => panic!("expected RefuseTasks, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_failure_retries_with_growing_backoff_then_stops() {
+        let f = FetchOutcome::Failed("connection refused".into());
+        assert_eq!(decide(&f, false, 0), HarnessAction::Retry { attempt: 0, delay_secs: 1 });
+        assert_eq!(decide(&f, false, 1), HarnessAction::Retry { attempt: 1, delay_secs: 4 });
+        assert_eq!(decide(&f, false, 2), HarnessAction::Retry { attempt: 2, delay_secs: 10 });
+        // exhausted
+        assert_eq!(
+            decide(&f, false, FETCH_MAX_ATTEMPTS),
+            HarnessAction::DegradedMode { reason: "connection refused".into() }
+        );
+    }
+
+    #[test]
+    fn an_exhausted_failure_under_require_refuses_rather_than_degrades() {
+        let f = FetchOutcome::Failed("[project_not_found]".into());
+        match decide(&f, true, FETCH_MAX_ATTEMPTS) {
+            HarnessAction::RefuseTasks { reason } => {
+                // The operator needs the cause, not just the policy.
+                assert!(reason.contains("project_not_found"), "reason must carry the error");
+            }
+            other => panic!("expected RefuseTasks, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn degraded_mode_carries_the_reason_for_the_announcement() {
+        // D20: the agent says in its channel that its skill is unavailable AND
+        // WHY. A reason that does not survive to here cannot be announced.
+        let f = FetchOutcome::Failed("engram timed out after 10s".into());
+        match decide(&f, false, FETCH_MAX_ATTEMPTS) {
+            HarnessAction::DegradedMode { reason } => assert_eq!(reason, "engram timed out after 10s"),
+            other => panic!("expected DegradedMode, got {other:?}"),
+        }
     }
 
     // ── validation: the refusals ────────────────────────────────────────────
