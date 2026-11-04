@@ -976,6 +976,8 @@ pub async fn run_startup_fetch() -> Option<StartupOutcome> {
         }
     };
 
+    mark_fetch_started();
+
     // The URL and project are logged; the PAT is not, and there is no branch
     // here that could put it in a line.
     tracing::info!(
@@ -1073,6 +1075,39 @@ pub fn record_installed(skill: InstalledSkill) {
 
 pub fn installed_skill() -> Option<InstalledSkill> {
     installed_slot().read().ok().and_then(|slot| slot.clone())
+}
+
+/// Whether a fetch is enabled and has not yet recorded a result.
+///
+/// ⚠️ This exists because of a window measured on DEV, not imagined: the agent
+/// reached `agent_pool_ready` and `presence set to online` **4.2 seconds
+/// before** `engram skill fetch: installed`. The fetch is spawned and never
+/// awaited, which is the design and is why startup is not blocked — but it
+/// means a session born inside that window composes its system prompt with no
+/// `<assigned-skill>` section, and the bootstrap is composed **once** at
+/// session birth.
+///
+/// The exposure is narrower than it looks: Goose re-reads skill *files* every
+/// turn, so such a session still gets the files from its next turn. What it
+/// misses for its whole life is the *instruction to load them* — which is
+/// exactly the condition measured at 1-in-4.
+///
+/// So this is instrumentation first. Whether it is worth closing depends on
+/// whether it ever fires in practice, and the honest way to find that out is
+/// to count it rather than to reason about it.
+pub fn fetch_pending() -> bool {
+    FETCH_STARTED.load(std::sync::atomic::Ordering::Relaxed)
+        && installed_slot()
+            .read()
+            .map(|slot| slot.is_none())
+            .unwrap_or(false)
+}
+
+/// Set once the switch is known to be on and a fetch is under way.
+static FETCH_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn mark_fetch_started() {
+    FETCH_STARTED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The bootstrap text for the current session, or `None` when nothing is
@@ -2218,8 +2253,8 @@ mod bootstrap_tests {
         );
     }
 
-    // ⚠️ There is deliberately NO test of `record_installed` / `installed_skill`
-    // here. One was written and it broke
+    // ⚠️ There is deliberately NO test of `record_installed`, `installed_skill`
+    // or `fetch_pending` here. One was written and it broke
     // `pool::model_switch_tests::session_new_sends_policy_specific_base_and_scope_specific_title`:
     // the slot is process-wide, the crate's tests share a process, and writing
     // it appended an `<assigned-skill>` section to an unrelated test's expected
@@ -2229,4 +2264,9 @@ mod bootstrap_tests {
     // prompt is hidden coupling, and the only reason it is acceptable here is
     // that the fetch is asynchronous and finishes AFTER the pool is built, so a
     // value captured at construction would be `None` forever.
+    //
+    // `fetch_pending` is the same story and one boolean: "a fetch started and
+    // nothing has been recorded yet". A test would have to set a process-wide
+    // flag that then stays set for every test that runs after it, and the only
+    // thing it gates is a `tracing::warn!`. Not worth the fragility.
 }

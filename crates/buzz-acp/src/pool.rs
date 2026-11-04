@@ -1501,6 +1501,18 @@ async fn create_session_and_apply_model(
     // `<channel-canvas>` boundary; both are appended with a blank-line separator.
     let is_goose = agent.agent_name == "goose";
     let assigned_skill_bootstrap = crate::engram_skill::bootstrap_instruction();
+    if assigned_skill_bootstrap.is_none() && crate::engram_skill::fetch_pending() {
+        // The startup window, measured on DEV at 4.2s: online before skilled.
+        // This session will carry no load instruction for its whole life, even
+        // though the files arrive moments later. Counting it is how we learn
+        // whether it is worth closing -- see `engram_skill::fetch_pending`.
+        tracing::warn!(
+            target: "pool::session",
+            "session born while the ENGRAM skill fetch is still in flight: this session gets no \
+             skill-load instruction. If this line is rare, the window is academic; if it recurs, \
+             move the bootstrap to turn start."
+        );
+    }
     let combined_system_prompt = with_assigned_skill(
         with_canvas(
             with_huddle_instructions(
