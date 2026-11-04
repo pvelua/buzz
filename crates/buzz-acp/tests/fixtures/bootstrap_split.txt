@@ -1,0 +1,11 @@
+Before you do anything else: load your assigned skill **and every reference it lists**. A split skill's SKILL.md is only an index — each part needs its own load_skill(name: "<skill>/references/<part>.md"). Follow the rules in all of them.
+
+Your assigned skill is `buzz-coder`, in 7 parts. Load each of these before you begin:
+- load_skill(name: "buzz-coder")
+- load_skill(name: "buzz-coder/references/working-discipline.md")
+- load_skill(name: "buzz-coder/references/working-together.md")
+- load_skill(name: "buzz-coder/references/working-with-engram.md")
+- load_skill(name: "buzz-coder/references/buzz-coder.md")
+- load_skill(name: "buzz-coder/references/channel-discipline.md")
+- load_skill(name: "buzz-coder/references/python-coding.md")
+- load_skill(name: "buzz-coder/references/git-workflow.md")

@@ -280,6 +280,17 @@ impl SkillMd {
         Ok(rels)
     }
 
+    /// The reference parts, in delivery order — every file that is not the
+    /// root `SKILL.md`. Empty for a single-file skill.
+    pub fn reference_paths(&self) -> Vec<String> {
+        self.files
+            .iter()
+            .map(|f| f.path.as_str())
+            .filter(|p| *p != ROOT_FILE)
+            .map(|p| p.to_string())
+            .collect()
+    }
+
     /// Replace `<skills_root>/<directory>` with this payload, atomically from
     /// the agent's point of view, and touching nothing else in the root.
     ///
@@ -865,8 +876,19 @@ pub const DEGRADED_RETRY_INTERVAL: Duration = Duration::from_secs(300);
 /// What the startup fetch settled on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartupOutcome {
-    /// Written. The path is the skill directory, for the log line.
-    Installed(PathBuf),
+    /// Written. Carries the directory path for the log line and the record the
+    /// session bootstrap needs.
+    ///
+    /// ⚠️ This RETURNS the record rather than storing it. Storing it here made
+    /// `fetch_with_policy`'s own tests write a process-wide slot that altered an
+    /// unrelated test's expected system prompt
+    /// (`pool::model_switch_tests::session_new_sends_policy_specific_base_and_scope_specific_title`).
+    /// The global write now happens only in `run_startup_fetch`, which no test
+    /// calls, so no tested path can leak into another test.
+    Installed {
+        path: PathBuf,
+        skill: InstalledSkill,
+    },
     /// Nothing to do, and nothing to say.
     StartedNormally,
     /// Up, but without the skill it was supposed to have. Announce and alert.
@@ -900,7 +922,16 @@ where
                     };
                 };
                 return match skill.write_into(&cfg.skills_root) {
-                    Ok(path) => StartupOutcome::Installed(path),
+                    // Built only after the write succeeded: an instruction to
+                    // load a skill that is not on disk sends the agent to a
+                    // tool call that fails.
+                    Ok(path) => StartupOutcome::Installed {
+                        path,
+                        skill: InstalledSkill {
+                            directory: skill.directory.clone(),
+                            references: skill.reference_paths(),
+                        },
+                    },
                     // A write failure is NOT retried: the payload was fine and
                     // the filesystem is not going to change its mind within
                     // the ladder. The reason names the offending path.
@@ -957,8 +988,13 @@ pub async fn run_startup_fetch() -> Option<StartupOutcome> {
     let mut outcome = fetch_with_policy(&cfg, || client.fetch(&cfg.project)).await;
 
     match &outcome {
-        StartupOutcome::Installed(path) => {
-            tracing::info!(path = %path.display(), "engram skill fetch: installed")
+        StartupOutcome::Installed { path, skill } => {
+            record_installed(skill.clone());
+            tracing::info!(
+                path = %path.display(),
+                parts = skill.references.len(),
+                "engram skill fetch: installed"
+            )
         }
         StartupOutcome::StartedNormally => {
             tracing::info!("engram skill fetch: nothing assigned, starting normally")
@@ -980,7 +1016,8 @@ pub async fn run_startup_fetch() -> Option<StartupOutcome> {
         tokio::time::sleep(DEGRADED_RETRY_INTERVAL).await;
         tracing::info!("engram skill fetch: retrying after degradation");
         outcome = fetch_with_policy(&cfg, || client.fetch(&cfg.project)).await;
-        if let StartupOutcome::Installed(path) = &outcome {
+        if let StartupOutcome::Installed { path, skill } = &outcome {
+            record_installed(skill.clone());
             tracing::info!(
                 path = %path.display(),
                 "engram skill fetch: recovered and installed"
@@ -989,6 +1026,92 @@ pub async fn run_startup_fetch() -> Option<StartupOutcome> {
     }
 
     Some(outcome)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The session bootstrap.
+//
+// Added to this release on 2026-11-04 by Igor's decision, and it is the part
+// that makes the rest of it matter. A skill's BODY is never in the system
+// prompt -- only its name and description -- so the body arrives if and only if
+// the model calls `load_skill`. Measured on DEV: the rule in a split skill
+// arrived in 1 of 4 runs unprompted, and in the runs where it did not, the
+// agent recommended the exact action its skill forbids. With this instruction
+// in the system prompt: 6 of 6, every reference loaded.
+//
+// So the writer putting a file on disk is necessary and NOT sufficient, and
+// that is why this lives beside it rather than in a follow-up.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// What the startup fetch installed, kept for the session bootstrap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledSkill {
+    /// The skill's directory name, which is also the name `load_skill` takes.
+    pub directory: String,
+    /// Its reference parts, relative to the skill directory. Empty when the
+    /// skill is a single file — in which case one `load_skill` gets everything.
+    pub references: Vec<String>,
+}
+
+/// Process-wide, because the fetch happens once at process start and every
+/// session afterwards needs to know what it found. `None` means no fetch has
+/// installed anything — the switch is off, or it failed — and the bootstrap is
+/// then absent rather than empty: an instruction to load a skill that is not
+/// there is worse than no instruction.
+static INSTALLED: std::sync::OnceLock<std::sync::RwLock<Option<InstalledSkill>>> =
+    std::sync::OnceLock::new();
+
+fn installed_slot() -> &'static std::sync::RwLock<Option<InstalledSkill>> {
+    INSTALLED.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+pub fn record_installed(skill: InstalledSkill) {
+    if let Ok(mut slot) = installed_slot().write() {
+        *slot = Some(skill);
+    }
+}
+
+pub fn installed_skill() -> Option<InstalledSkill> {
+    installed_slot().read().ok().and_then(|slot| slot.clone())
+}
+
+/// The bootstrap text for the current session, or `None` when nothing is
+/// installed.
+///
+/// ⚠️ The wording is load-bearing and was measured. Two things it must keep:
+/// it must say **"and every reference it lists"**, because `load_skill("<skill>")`
+/// on a split skill returns only the index; and it must give the explicit
+/// `"<skill>/references/<part>.md"` form, because the index alone did not get
+/// the parts loaded. Changing this string means re-running the measurement.
+pub fn bootstrap_instruction() -> Option<String> {
+    bootstrap_text(installed_skill().as_ref())
+}
+
+/// `bootstrap_instruction` over an explicit value, so it is testable without
+/// the process-wide slot.
+pub fn bootstrap_text(skill: Option<&InstalledSkill>) -> Option<String> {
+    let skill = skill?;
+    let dir = &skill.directory;
+    if skill.references.is_empty() {
+        // One file: a single load gets the whole skill, and mentioning
+        // references that do not exist would invite a call that fails.
+        return Some(format!(
+            "Before you do anything else, load the skill you have been assigned and follow it:\n\
+             - load_skill(name: \"{dir}\")"
+        ));
+    }
+    let mut out = format!(
+        "Before you do anything else: load your assigned skill **and every reference it lists**. \
+         A split skill's SKILL.md is only an index — each part needs its own \
+         load_skill(name: \"<skill>/references/<part>.md\"). Follow the rules in all of them.\n\n\
+         Your assigned skill is `{dir}`, in {n} parts. Load each of these before you begin:\n\
+         - load_skill(name: \"{dir}\")",
+        n = skill.references.len()
+    );
+    for reference in &skill.references {
+        out.push_str(&format!("\n- load_skill(name: \"{dir}/{reference}\")"));
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -1842,10 +1965,14 @@ mod policy_tests {
         let cfg = test_cfg(root.path(), false);
         let script = Script::new(vec![assigned()]);
         let out = fetch_with_policy(&cfg, || async { script.next() }).await;
-        assert_eq!(
-            out,
-            StartupOutcome::Installed(root.path().join("buzz-coder"))
-        );
+        match &out {
+            StartupOutcome::Installed { path, skill } => {
+                assert_eq!(path, &root.path().join("buzz-coder"));
+                assert_eq!(skill.directory, "buzz-coder");
+                assert_eq!(skill.references.len(), 7);
+            }
+            other => panic!("expected Installed, got {other:?}"),
+        }
         assert_eq!(script.calls(), 1, "a success must not retry");
         assert!(root.path().join("buzz-coder/SKILL.md").is_file());
         assert!(root
@@ -1864,7 +1991,7 @@ mod policy_tests {
             assigned(),
         ]);
         let out = fetch_with_policy(&cfg, || async { script.next() }).await;
-        assert!(matches!(out, StartupOutcome::Installed(_)), "{out:?}");
+        assert!(matches!(out, StartupOutcome::Installed { .. }), "{out:?}");
         assert_eq!(script.calls(), 3);
     }
 
@@ -1984,4 +2111,122 @@ mod policy_tests {
             other => panic!("expected Degraded, got {other:?}"),
         }
     }
+}
+
+#[cfg(test)]
+mod bootstrap_tests {
+    use super::*;
+
+    fn split_skill() -> InstalledSkill {
+        let skill = interpret_payload(include_str!("../tests/fixtures/assigned_split.json"))
+            .skill_md
+            .unwrap();
+        InstalledSkill {
+            directory: skill.directory.clone(),
+            references: skill.reference_paths(),
+        }
+    }
+
+    /// ⚠️ A golden file, and it is not decoration. The string in
+    /// `tests/fixtures/bootstrap_split.txt` is the **exact** text that was put
+    /// in front of the model on DEV for the measurement that justifies this
+    /// whole mechanism: 6 of 6 runs loaded all seven references and refused the
+    /// forbidden action. If this test fails, the code no longer emits the
+    /// string that was measured, and the measurement no longer supports it —
+    /// so the correct response is to re-run the measurement, not to update the
+    /// fixture.
+    #[test]
+    fn the_emitted_string_is_byte_for_byte_the_one_that_was_measured() {
+        assert_eq!(
+            bootstrap_text(Some(&split_skill())).unwrap(),
+            include_str!("../tests/fixtures/bootstrap_split.txt")
+        );
+    }
+
+    #[test]
+    fn nothing_installed_means_no_instruction_at_all() {
+        // Not an empty string: an instruction to load a skill that is not on
+        // disk sends the agent to a tool call that fails, so absence is the
+        // correct output when the switch is off or the fetch failed.
+        assert_eq!(bootstrap_text(None), None);
+    }
+
+    #[test]
+    fn reference_paths_excludes_the_root_and_keeps_delivery_order() {
+        let skill = interpret_payload(include_str!("../tests/fixtures/assigned_split.json"))
+            .skill_md
+            .unwrap();
+        let refs = skill.reference_paths();
+        assert_eq!(refs.len(), 7, "8 files minus the root");
+        assert!(!refs.iter().any(|r| r == "SKILL.md"));
+        assert_eq!(refs[0], "references/working-discipline.md");
+        assert_eq!(refs[6], "references/git-workflow.md");
+    }
+
+    #[test]
+    fn a_single_file_skill_gets_one_load_and_no_talk_of_references() {
+        let skill = interpret_payload(include_str!("../tests/fixtures/assigned_single_file.json"))
+            .skill_md
+            .unwrap();
+        let installed = InstalledSkill {
+            directory: skill.directory.clone(),
+            references: skill.reference_paths(),
+        };
+        assert!(installed.references.is_empty());
+        let text = bootstrap_text(Some(&installed)).unwrap();
+        assert!(text.contains(r#"load_skill(name: "buzz-coder")"#));
+        // Mentioning references that do not exist would invite a failing call.
+        assert!(!text.contains("references/"), "{text}");
+    }
+
+    #[test]
+    fn a_split_skill_names_every_part_explicitly() {
+        let text = bootstrap_text(Some(&split_skill())).unwrap();
+        for part in [
+            "working-discipline",
+            "working-together",
+            "working-with-engram",
+            "buzz-coder",
+            "channel-discipline",
+            "python-coding",
+            "git-workflow",
+        ] {
+            let expected = format!(r#"load_skill(name: "buzz-coder/references/{part}.md")"#);
+            assert!(text.contains(&expected), "missing {expected}\n---\n{text}");
+        }
+        assert!(text.contains("in 7 parts"));
+    }
+
+    #[test]
+    fn the_two_measured_phrases_survive_any_future_edit() {
+        // These are the parts the DEV measurement attributes the 6-of-6 to.
+        // Dropping either is the failure this test exists to catch: without
+        // "every reference it lists" the model loads the index and stops, and
+        // without the explicit path form it does not reach the parts at all.
+        let text = bootstrap_text(Some(&split_skill())).unwrap();
+        assert!(
+            text.contains("every reference it lists"),
+            "the phrase that gets the parts loaded is gone"
+        );
+        assert!(
+            text.contains("/references/"),
+            "the explicit reference path form is gone"
+        );
+        assert!(
+            text.starts_with("Before you do anything else"),
+            "the instruction must come first in its own section"
+        );
+    }
+
+    // ⚠️ There is deliberately NO test of `record_installed` / `installed_skill`
+    // here. One was written and it broke
+    // `pool::model_switch_tests::session_new_sends_policy_specific_base_and_scope_specific_title`:
+    // the slot is process-wide, the crate's tests share a process, and writing
+    // it appended an `<assigned-skill>` section to an unrelated test's expected
+    // system prompt. Isolating it is not worth it — the slot is three lines and
+    // every decision it feeds is `bootstrap_text`, which is tested above. The
+    // leak itself is the finding: a process-global that alters every system
+    // prompt is hidden coupling, and the only reason it is acceptable here is
+    // that the fetch is asynchronous and finishes AFTER the pool is built, so a
+    // value captured at construction would be `None` forever.
 }

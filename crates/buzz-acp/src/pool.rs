@@ -1500,22 +1500,26 @@ async fn create_session_and_apply_model(
     // its own `<core-memory>` boundary, and canvas carries its own
     // `<channel-canvas>` boundary; both are appended with a blank-line separator.
     let is_goose = agent.agent_name == "goose";
-    let combined_system_prompt = with_canvas(
-        with_huddle_instructions(
-            with_core(
-                with_team(
-                    framed_system_prompt(
-                        &ctx.cwd,
-                        ctx.base_prompt.as_deref(),
-                        ctx.system_prompt.as_deref(),
+    let assigned_skill_bootstrap = crate::engram_skill::bootstrap_instruction();
+    let combined_system_prompt = with_assigned_skill(
+        with_canvas(
+            with_huddle_instructions(
+                with_core(
+                    with_team(
+                        framed_system_prompt(
+                            &ctx.cwd,
+                            ctx.base_prompt.as_deref(),
+                            ctx.system_prompt.as_deref(),
+                        ),
+                        ctx.team_instructions.as_deref(),
                     ),
-                    ctx.team_instructions.as_deref(),
+                    agent_core,
                 ),
-                agent_core,
+                channel.huddle_instructions,
             ),
-            channel.huddle_instructions,
+            channel.canvas,
         ),
-        channel.canvas,
+        assigned_skill_bootstrap.as_deref(),
     );
 
     let session_title = ctx.session_title.as_deref().map(|agent_name| {
@@ -2233,6 +2237,31 @@ fn with_core(framed: Option<String>, core: Option<&str>) -> Option<String> {
         (Some(framed), Some(core)) => Some(format!("{framed}\n\n{core}")),
         (Some(framed), None) => Some(framed),
         (None, Some(core)) => Some(core),
+        (None, None) => None,
+    }
+}
+
+/// Append the instruction to load the ENGRAM-assigned skill and its references.
+///
+/// ⚠️ This is LAST in the chain, deliberately. The instruction tells the agent
+/// what to do *before anything else*, and a reader — human or model — takes the
+/// final instruction in a prompt as the operative one. It is also the only
+/// section whose absence is correct: with the fetch switched off, or after a
+/// failed fetch, `bootstrap_instruction` is `None` and nothing is appended,
+/// because telling an agent to load a skill that is not on disk is worse than
+/// saying nothing.
+fn with_assigned_skill(prompt: Option<String>, instruction: Option<&str>) -> Option<String> {
+    let instruction = instruction.map(str::trim).filter(|value| !value.is_empty());
+    match (prompt, instruction) {
+        (Some(prompt), Some(instruction)) => Some(format!(
+            "{prompt}\n\n{}",
+            crate::prompt_framing::semantic_section("assigned-skill", instruction)
+        )),
+        (None, Some(instruction)) => Some(crate::prompt_framing::semantic_section(
+            "assigned-skill",
+            instruction,
+        )),
+        (Some(prompt), None) => Some(prompt),
         (None, None) => None,
     }
 }
@@ -11982,3 +12011,49 @@ done"#
 #[cfg(all(test, unix))]
 #[path = "pool/pi_prompt_tests.rs"]
 mod pi_prompt_tests;
+
+#[cfg(test)]
+mod assigned_skill_prompt_tests {
+    use super::*;
+
+    const INSTRUCTION: &str = "Before you do anything else: load your assigned skill";
+
+    #[test]
+    fn the_bootstrap_is_appended_last_so_it_reads_as_operative() {
+        let out = with_assigned_skill(Some("BASE PROMPT".to_string()), Some(INSTRUCTION)).unwrap();
+        assert!(out.starts_with("BASE PROMPT"));
+        assert!(out.contains("assigned-skill"));
+        let base_at = out.find("BASE PROMPT").unwrap();
+        let instr_at = out.find(INSTRUCTION).unwrap();
+        assert!(
+            instr_at > base_at,
+            "the instruction must come after the base"
+        );
+    }
+
+    #[test]
+    fn no_instruction_leaves_the_prompt_byte_for_byte_unchanged() {
+        // The switch-off case, and the one that matters for every stack that
+        // has not enabled the fetch: the prompt must be exactly what it was.
+        assert_eq!(
+            with_assigned_skill(Some("BASE PROMPT".to_string()), None),
+            Some("BASE PROMPT".to_string())
+        );
+        assert_eq!(with_assigned_skill(None, None), None);
+    }
+
+    #[test]
+    fn a_blank_instruction_is_treated_as_absent() {
+        assert_eq!(
+            with_assigned_skill(Some("BASE".to_string()), Some("   \n ")),
+            Some("BASE".to_string())
+        );
+    }
+
+    #[test]
+    fn an_instruction_with_no_other_prompt_still_gets_its_section() {
+        let out = with_assigned_skill(None, Some(INSTRUCTION)).unwrap();
+        assert!(out.contains("assigned-skill"));
+        assert!(out.contains(INSTRUCTION));
+    }
+}
