@@ -34,6 +34,7 @@
 
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -69,7 +70,10 @@ pub struct SkillFile {
 #[derive(Debug, PartialEq, Eq)]
 pub enum SkillWriteError {
     /// `directory` is not a single, safe path segment.
-    BadDirectory { directory: String, why: &'static str },
+    BadDirectory {
+        directory: String,
+        why: &'static str,
+    },
     /// A `files[].path` is not a safe relative path.
     BadPath { path: String, why: &'static str },
     /// No entry at the root spelled exactly `SKILL.md`.
@@ -83,7 +87,11 @@ pub enum SkillWriteError {
     /// `files` is empty — there is no such thing as a skill with no `SKILL.md`.
     NoFiles,
     /// Filesystem failure, with the operation that failed.
-    Io { op: &'static str, path: String, msg: String },
+    Io {
+        op: &'static str,
+        path: String,
+        msg: String,
+    },
 }
 
 impl std::fmt::Display for SkillWriteError {
@@ -92,7 +100,9 @@ impl std::fmt::Display for SkillWriteError {
             Self::BadDirectory { directory, why } => {
                 write!(f, "skill_md.directory {directory:?} is unusable: {why}")
             }
-            Self::BadPath { path, why } => write!(f, "skill_md file path {path:?} is unusable: {why}"),
+            Self::BadPath { path, why } => {
+                write!(f, "skill_md file path {path:?} is unusable: {why}")
+            }
             Self::MissingRootSkillMd => write!(
                 f,
                 "skill_md has no root {ROOT_FILE} (a lowercase `skill.md` is invisible to Goose)"
@@ -135,7 +145,11 @@ fn check_segment(seg: &str) -> Result<(), &'static str> {
 /// Build an `Io` error naming the operation and the path. A filesystem failure
 /// that does not say which path failed is not actionable.
 fn io_err(op: &'static str, path: &Path, e: std::io::Error) -> SkillWriteError {
-    SkillWriteError::Io { op, path: path.display().to_string(), msg: e.to_string() }
+    SkillWriteError::Io {
+        op,
+        path: path.display().to_string(),
+        msg: e.to_string(),
+    }
 }
 
 impl SkillMd {
@@ -163,7 +177,10 @@ impl SkillMd {
             // legal filename character, so "fixing" it would silently create a
             // file whose name is not the one ENGRAM named.
             if raw.is_empty() {
-                return Err(SkillWriteError::BadPath { path: raw.to_string(), why: "it is empty" });
+                return Err(SkillWriteError::BadPath {
+                    path: raw.to_string(),
+                    why: "it is empty",
+                });
             }
             if raw.starts_with('/') {
                 return Err(SkillWriteError::BadPath {
@@ -233,17 +250,24 @@ impl SkillMd {
             }
 
             if seen.iter().any(|s| s == raw) {
-                return Err(SkillWriteError::DuplicatePath { path: raw.to_string() });
+                return Err(SkillWriteError::DuplicatePath {
+                    path: raw.to_string(),
+                });
             }
             seen.push(raw.to_string());
 
             let depth = rel.components().count();
-            let base = rel.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let base = rel
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
             if base == ROOT_FILE {
                 if depth == 1 {
                     has_root = true;
                 } else {
-                    return Err(SkillWriteError::NestedSkillMd { path: raw.to_string() });
+                    return Err(SkillWriteError::NestedSkillMd {
+                        path: raw.to_string(),
+                    });
                 }
             }
 
@@ -271,7 +295,6 @@ impl SkillMd {
         // should also see at a glance that these are not skills.
         let staging = skills_root.join(format!(".{}.incoming", &self.directory));
         let retired = skills_root.join(format!(".{}.retired", &self.directory));
-
 
         // A leftover staging or retired directory means a previous run died
         // mid-swap. Clearing them is safe precisely because they are ours.
@@ -382,7 +405,11 @@ fn backoff_secs(attempt: u32) -> u64 {
 
 /// Decide, given the outcome, the project's `require_assigned_skill`, and how
 /// many attempts have already been made.
-pub fn decide(outcome: &FetchOutcome, require_assigned_skill: bool, attempts: u32) -> HarnessAction {
+pub fn decide(
+    outcome: &FetchOutcome,
+    require_assigned_skill: bool,
+    attempts: u32,
+) -> HarnessAction {
     match outcome {
         FetchOutcome::Assigned => HarnessAction::InstallSkill,
 
@@ -399,7 +426,8 @@ pub fn decide(outcome: &FetchOutcome, require_assigned_skill: bool, attempts: u3
         FetchOutcome::NoSkillAssigned => {
             if require_assigned_skill {
                 HarnessAction::RefuseTasks {
-                    reason: "no skill is assigned and this project sets require_assigned_skill".into(),
+                    reason: "no skill is assigned and this project sets require_assigned_skill"
+                        .into(),
                 }
             } else {
                 HarnessAction::StartNormally
@@ -408,35 +436,348 @@ pub fn decide(outcome: &FetchOutcome, require_assigned_skill: bool, attempts: u3
 
         FetchOutcome::Failed(reason) => {
             if attempts < FETCH_MAX_ATTEMPTS {
-                HarnessAction::Retry { attempt: attempts, delay_secs: backoff_secs(attempts) }
+                HarnessAction::Retry {
+                    attempt: attempts,
+                    delay_secs: backoff_secs(attempts),
+                }
             } else if require_assigned_skill {
                 HarnessAction::RefuseTasks {
                     reason: format!("could not fetch the assigned skill ({reason}); require_assigned_skill is set"),
                 }
             } else {
-                HarnessAction::DegradedMode { reason: reason.clone() }
+                HarnessAction::DegradedMode {
+                    reason: reason.clone(),
+                }
             }
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Item 1: the fetch. `get_assigned_skill(project, format="skill_md")` over
+// streamable HTTP, reduced to a `FetchOutcome` plus the payload.
+//
+// The transport is split from the interpretation on purpose: everything that
+// decides *meaning* is a pure function over bytes, tested against payloads
+// recorded from the live DEV relay (`tests/fixtures/assigned_*.json`). Only the
+// three HTTP calls are untested here, and they are what S6 measures on DEV.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// What a fetch produced: the outcome `decide` reasons about, and the payload
+/// when there is one.
+#[derive(Debug, Clone)]
+pub struct Fetched {
+    pub outcome: FetchOutcome,
+    /// `Some` only when `outcome` is `Assigned`.
+    pub skill_md: Option<SkillMd>,
+}
+
+impl Fetched {
+    fn failed(reason: impl Into<String>) -> Self {
+        Fetched {
+            outcome: FetchOutcome::Failed(reason.into()),
+            skill_md: None,
+        }
+    }
+
+    fn plain(outcome: FetchOutcome) -> Self {
+        Fetched {
+            outcome,
+            skill_md: None,
+        }
+    }
+}
+
+/// ENGRAM's tool errors arrive behind this prefix, and the contract says the
+/// text after it "starts with a bracketed code and only the code".
+const TOOL_ERROR_PREFIX: &str = "Error executing tool get_assigned_skill: ";
+
+/// The bracketed code from a tool error, e.g. `project_not_found`.
+///
+/// Returns `None` when the text is not in that shape — in which case the whole
+/// text is the diagnosis and must be carried verbatim rather than summarised.
+pub fn error_code(text: &str) -> Option<&str> {
+    let rest = text
+        .strip_prefix(TOOL_ERROR_PREFIX)
+        .unwrap_or(text)
+        .trim_start();
+    let rest = rest.strip_prefix('[')?;
+    let end = rest.find(']')?;
+    let code = &rest[..end];
+    if code.is_empty() || code.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(code)
+}
+
+/// Pull the JSON-RPC object out of a streamable-HTTP body.
+///
+/// A streamable-HTTP endpoint may answer with a bare JSON object or with SSE
+/// frames; the same request can get either, so both are handled rather than
+/// configured.
+pub fn extract_envelope(raw: &str) -> Result<serde_json::Value, String> {
+    let trimmed = raw.trim_start();
+    if trimmed.is_empty() {
+        return Err("empty response body".to_string());
+    }
+    if trimmed.starts_with("event:") || trimmed.starts_with("data:") {
+        // Take the first `data:` frame. A JSON-RPC reply to a single request is
+        // one frame; anything further belongs to a stream we did not ask for.
+        for line in trimmed.lines() {
+            if let Some(payload) = line.strip_prefix("data:") {
+                let payload = payload.trim();
+                if payload.is_empty() {
+                    continue;
+                }
+                return serde_json::from_str(payload)
+                    .map_err(|e| format!("SSE frame is not JSON: {e}"));
+            }
+        }
+        return Err("SSE body carried no data frame".to_string());
+    }
+    serde_json::from_str(trimmed).map_err(|e| format!("response is not JSON: {e}"))
+}
+
+/// Interpret the text a successful `tools/call` returned.
+///
+/// ⚠️ The payload is the tool's JSON **directly** — `{"status": …}`. It is NOT
+/// wrapped in `{"result": "<json string>"}`; that wrapper is how some MCP
+/// *clients* render a tool result for display, and building this parser from a
+/// client's rendering rather than from the wire would look right and never
+/// match a real response.
+pub fn interpret_payload(text: &str) -> Fetched {
+    let value: serde_json::Value = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(e) => return Fetched::failed(format!("tool text is not JSON: {e}")),
+    };
+
+    let status = match value.get("status").and_then(|s| s.as_str()) {
+        Some(s) => s,
+        // No `status` at all is a contract breach, and a silent one: every
+        // branch below would otherwise fall through to "nothing assigned",
+        // which is the one reading that announces nothing.
+        None => return Fetched::failed("payload carried no `status` field"),
+    };
+
+    match status {
+        "no_skill_assigned" => Fetched::plain(FetchOutcome::NoSkillAssigned),
+        "skills_disabled" => Fetched::plain(FetchOutcome::SkillsDisabled),
+        "assigned" => match value.get("skill_md") {
+            Some(raw) => match serde_json::from_value::<SkillMd>(raw.clone()) {
+                Ok(skill_md) => Fetched {
+                    outcome: FetchOutcome::Assigned,
+                    skill_md: Some(skill_md),
+                },
+                Err(e) => Fetched::failed(format!("`skill_md` did not parse: {e}")),
+            },
+            // We asked for `format="skill_md"`. Getting `assigned` without it
+            // is not a skill we can install, so it must not read as success.
+            None => Fetched::failed("status `assigned` carried no `skill_md`"),
+        },
+        other => Fetched::failed(format!("unknown status `{other}`")),
+    }
+}
+
+/// Interpret a whole JSON-RPC envelope from a `tools/call`.
+pub fn interpret_envelope(envelope: &serde_json::Value) -> Fetched {
+    if let Some(err) = envelope.get("error") {
+        let msg = err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unspecified JSON-RPC error");
+        return Fetched::failed(format!("JSON-RPC error: {msg}"));
+    }
+
+    let result = match envelope.get("result") {
+        Some(r) => r,
+        None => return Fetched::failed("envelope carried neither `result` nor `error`"),
+    };
+
+    let text = result
+        .get("content")
+        .and_then(|c| c.as_array())
+        .and_then(|blocks| {
+            blocks.iter().find_map(|b| {
+                if b.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    b.get("text").and_then(|t| t.as_str())
+                } else {
+                    None
+                }
+            })
+        });
+
+    let text = match text {
+        Some(t) => t,
+        None => return Fetched::failed("tool result carried no text block"),
+    };
+
+    // A tool error is reported in the result, not as a JSON-RPC error. Read the
+    // bracketed code when there is one and carry the text when there is not.
+    let is_error = result
+        .get("isError")
+        .or_else(|| result.get("is_error"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if is_error {
+        return match error_code(text) {
+            Some(code) => Fetched::failed(format!("[{code}]")),
+            None => Fetched::failed(text.to_string()),
+        };
+    }
+
+    interpret_payload(text)
+}
+
+/// The three HTTP calls: `initialize`, `notifications/initialized`,
+/// `tools/call`. One short-lived MCP session per fetch — a session held open
+/// across turns would be state we would have to reason about on reconnect, and
+/// the fetch happens once per process start.
+pub struct EngramSkillClient {
+    url: String,
+    pat: String,
+    http: reqwest::Client,
+}
+
+impl EngramSkillClient {
+    /// `url` is ENGRAM's MCP endpoint (`ENGRAM_MCP_URL`), `pat` the agent's own
+    /// token (`ENGRAM_PAT`). The PAT is held here and never logged: it is a
+    /// credential, and a credential in a log line is a credential to rotate.
+    pub fn new(
+        url: impl Into<String>,
+        pat: impl Into<String>,
+        timeout: Duration,
+    ) -> Result<Self, String> {
+        let http = reqwest::Client::builder()
+            .timeout(timeout)
+            .build()
+            .map_err(|e| format!("could not build HTTP client: {e}"))?;
+        Ok(Self {
+            url: url.into(),
+            pat: pat.into(),
+            http,
+        })
+    }
+
+    async fn post(&self, body: String, session: &mut Option<String>) -> Result<String, String> {
+        let mut req = self
+            .http
+            .post(&self.url)
+            .header("Authorization", format!("Bearer {}", self.pat))
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(body);
+        if let Some(id) = session.as_deref() {
+            req = req.header("Mcp-Session-Id", id);
+        }
+
+        let resp = req.send().await.map_err(|e| {
+            // `reqwest`'s Display includes the URL but never the headers, so
+            // this cannot leak the PAT.
+            format!("transport: {e}")
+        })?;
+
+        if let Some(id) = resp
+            .headers()
+            .get("Mcp-Session-Id")
+            .and_then(|v| v.to_str().ok())
+        {
+            *session = Some(id.to_string());
+        }
+
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| format!("could not read body: {e}"))?;
+        if !status.is_success() {
+            // Carry the code AND a bounded slice of the body: a bare 401 does
+            // not distinguish a wrong PAT from a revoked one.
+            let snippet: String = text.chars().take(200).collect();
+            return Err(format!("HTTP {status}: {snippet}"));
+        }
+        Ok(text)
+    }
+
+    /// Fetch this agent's assigned skill for `project`.
+    ///
+    /// Never returns `Err`: every failure is a `FetchOutcome::Failed` carrying
+    /// its reason, because the caller's next step is `decide`, and a `Result`
+    /// at this boundary invites a `?` that would abort session start — the one
+    /// thing D20 says must not happen.
+    pub async fn fetch(&self, project: &str) -> Fetched {
+        let mut session: Option<String> = None;
+
+        let init = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": { "name": "buzz-acp", "version": env!("CARGO_PKG_VERSION") }
+            }
+        });
+        if let Err(e) = self.post(init.to_string(), &mut session).await {
+            return Fetched::failed(format!("initialize failed: {e}"));
+        }
+
+        let ready = serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
+        if let Err(e) = self.post(ready.to_string(), &mut session).await {
+            return Fetched::failed(format!("initialized notification failed: {e}"));
+        }
+
+        let call = serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {
+                "name": "get_assigned_skill",
+                // The project is explicit. Finding 2 of the review: an ambient
+                // call returns `[project_not_found]` as soon as the agent can
+                // read more than one project, and that error reads like a
+                // permissions fault rather than a missing argument.
+                "arguments": { "project": project, "format": "skill_md" }
+            }
+        });
+        let raw = match self.post(call.to_string(), &mut session).await {
+            Ok(r) => r,
+            Err(e) => return Fetched::failed(format!("tools/call failed: {e}")),
+        };
+
+        match extract_envelope(&raw) {
+            Ok(envelope) => interpret_envelope(&envelope),
+            Err(e) => Fetched::failed(e),
+        }
+    }
+}
+
+/// The protocol version our handshake declares. Pinned rather than derived: a
+/// version we have not called ENGRAM with is a version we have not tested.
+const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn file(path: &str, content: &str) -> SkillFile {
-        SkillFile { path: path.to_string(), content: content.to_string() }
+        SkillFile {
+            path: path.to_string(),
+            content: content.to_string(),
+        }
     }
 
     fn payload(directory: &str, files: Vec<SkillFile>) -> SkillMd {
-        SkillMd { directory: directory.to_string(), split: false, files }
+        SkillMd {
+            directory: directory.to_string(),
+            split: false,
+            files,
+        }
     }
 
     fn good() -> SkillMd {
         payload(
             "buzz-coder",
             vec![
-                file("SKILL.md", "---\nname: buzz-coder\ndescription: d\n---\nbody\n"),
+                file(
+                    "SKILL.md",
+                    "---\nname: buzz-coder\ndescription: d\n---\nbody\n",
+                ),
                 file("references/part-one.md", "part one\n"),
             ],
         )
@@ -458,30 +799,48 @@ mod tests {
 
     #[test]
     fn an_assigned_skill_is_installed() {
-        assert_eq!(decide(&FetchOutcome::Assigned, false, 0), HarnessAction::InstallSkill);
-        assert_eq!(decide(&FetchOutcome::Assigned, true, 0), HarnessAction::InstallSkill);
+        assert_eq!(
+            decide(&FetchOutcome::Assigned, false, 0),
+            HarnessAction::InstallSkill
+        );
+        assert_eq!(
+            decide(&FetchOutcome::Assigned, true, 0),
+            HarnessAction::InstallSkill
+        );
     }
 
     #[test]
     fn no_skill_assigned_is_not_a_failure() {
         // The trap: it is a RESULT. Degrading here would announce an outage in a
         // channel for an agent that is working perfectly.
-        assert_eq!(decide(&FetchOutcome::NoSkillAssigned, false, 0), HarnessAction::StartNormally);
+        assert_eq!(
+            decide(&FetchOutcome::NoSkillAssigned, false, 0),
+            HarnessAction::StartNormally
+        );
     }
 
     #[test]
     fn skills_disabled_is_silent_even_when_a_skill_is_required() {
         // The feature is off deliberately; refusing every task because of a
         // setting someone switched off would take the agent down for no fault.
-        assert_eq!(decide(&FetchOutcome::SkillsDisabled, false, 0), HarnessAction::StartNormally);
-        assert_eq!(decide(&FetchOutcome::SkillsDisabled, true, 0), HarnessAction::StartNormally);
+        assert_eq!(
+            decide(&FetchOutcome::SkillsDisabled, false, 0),
+            HarnessAction::StartNormally
+        );
+        assert_eq!(
+            decide(&FetchOutcome::SkillsDisabled, true, 0),
+            HarnessAction::StartNormally
+        );
     }
 
     #[test]
     fn require_assigned_skill_refuses_tasks_without_exiting() {
         match decide(&FetchOutcome::NoSkillAssigned, true, 0) {
             HarnessAction::RefuseTasks { reason } => {
-                assert!(reason.contains("require_assigned_skill"), "reason must name the setting");
+                assert!(
+                    reason.contains("require_assigned_skill"),
+                    "reason must name the setting"
+                );
             }
             other => panic!("expected RefuseTasks, got {other:?}"),
         }
@@ -490,13 +849,33 @@ mod tests {
     #[test]
     fn a_failure_retries_with_growing_backoff_then_stops() {
         let f = FetchOutcome::Failed("connection refused".into());
-        assert_eq!(decide(&f, false, 0), HarnessAction::Retry { attempt: 0, delay_secs: 1 });
-        assert_eq!(decide(&f, false, 1), HarnessAction::Retry { attempt: 1, delay_secs: 4 });
-        assert_eq!(decide(&f, false, 2), HarnessAction::Retry { attempt: 2, delay_secs: 10 });
+        assert_eq!(
+            decide(&f, false, 0),
+            HarnessAction::Retry {
+                attempt: 0,
+                delay_secs: 1
+            }
+        );
+        assert_eq!(
+            decide(&f, false, 1),
+            HarnessAction::Retry {
+                attempt: 1,
+                delay_secs: 4
+            }
+        );
+        assert_eq!(
+            decide(&f, false, 2),
+            HarnessAction::Retry {
+                attempt: 2,
+                delay_secs: 10
+            }
+        );
         // exhausted
         assert_eq!(
             decide(&f, false, FETCH_MAX_ATTEMPTS),
-            HarnessAction::DegradedMode { reason: "connection refused".into() }
+            HarnessAction::DegradedMode {
+                reason: "connection refused".into()
+            }
         );
     }
 
@@ -506,7 +885,10 @@ mod tests {
         match decide(&f, true, FETCH_MAX_ATTEMPTS) {
             HarnessAction::RefuseTasks { reason } => {
                 // The operator needs the cause, not just the policy.
-                assert!(reason.contains("project_not_found"), "reason must carry the error");
+                assert!(
+                    reason.contains("project_not_found"),
+                    "reason must carry the error"
+                );
             }
             other => panic!("expected RefuseTasks, got {other:?}"),
         }
@@ -518,7 +900,9 @@ mod tests {
         // WHY. A reason that does not survive to here cannot be announced.
         let f = FetchOutcome::Failed("engram timed out after 10s".into());
         match decide(&f, false, FETCH_MAX_ATTEMPTS) {
-            HarnessAction::DegradedMode { reason } => assert_eq!(reason, "engram timed out after 10s"),
+            HarnessAction::DegradedMode { reason } => {
+                assert_eq!(reason, "engram timed out after 10s")
+            }
             other => panic!("expected DegradedMode, got {other:?}"),
         }
     }
@@ -527,7 +911,9 @@ mod tests {
 
     #[test]
     fn accepts_the_contract_shape() {
-        let rels = good().validate().expect("the documented shape must validate");
+        let rels = good()
+            .validate()
+            .expect("the documented shape must validate");
         assert_eq!(rels.len(), 2);
     }
 
@@ -544,7 +930,12 @@ mod tests {
 
     #[test]
     fn refuses_path_traversal_and_absolutes() {
-        for bad in ["../escape.md", "references/../../escape.md", "/etc/passwd", "a/./b.md"] {
+        for bad in [
+            "../escape.md",
+            "references/../../escape.md",
+            "/etc/passwd",
+            "a/./b.md",
+        ] {
             let p = payload("s", vec![file("SKILL.md", "x"), file(bad, "x")]);
             match p.validate() {
                 Err(SkillWriteError::BadPath { .. }) => {}
@@ -557,7 +948,10 @@ mod tests {
     fn refuses_a_backslash_rather_than_normalising_it() {
         // On Linux `a\b.md` is one legal filename, so silently "fixing" it
         // would create a file ENGRAM never named.
-        let p = payload("s", vec![file("SKILL.md", "x"), file("references\\part.md", "x")]);
+        let p = payload(
+            "s",
+            vec![file("SKILL.md", "x"), file("references\\part.md", "x")],
+        );
         assert!(matches!(p.validate(), Err(SkillWriteError::BadPath { .. })));
     }
 
@@ -579,19 +973,29 @@ mod tests {
         );
         assert_eq!(
             p.validate(),
-            Err(SkillWriteError::NestedSkillMd { path: "references/SKILL.md".into() })
+            Err(SkillWriteError::NestedSkillMd {
+                path: "references/SKILL.md".into()
+            })
         );
     }
 
     #[test]
     fn refuses_duplicate_paths() {
         let p = payload("s", vec![file("SKILL.md", "a"), file("SKILL.md", "b")]);
-        assert_eq!(p.validate(), Err(SkillWriteError::DuplicatePath { path: "SKILL.md".into() }));
+        assert_eq!(
+            p.validate(),
+            Err(SkillWriteError::DuplicatePath {
+                path: "SKILL.md".into()
+            })
+        );
     }
 
     #[test]
     fn refuses_an_empty_file_set() {
-        assert_eq!(payload("s", vec![]).validate(), Err(SkillWriteError::NoFiles));
+        assert_eq!(
+            payload("s", vec![]).validate(),
+            Err(SkillWriteError::NoFiles)
+        );
     }
 
     // ── writing ────────────────────────────────────────────────────────────
@@ -602,7 +1006,10 @@ mod tests {
         let target = good().write_into(root.path()).expect("write");
         assert_eq!(target, root.path().join("buzz-coder"));
         assert!(target.join(ROOT_FILE).is_file());
-        assert_eq!(fs::read_to_string(target.join("references/part-one.md")).unwrap(), "part one\n");
+        assert_eq!(
+            fs::read_to_string(target.join("references/part-one.md")).unwrap(),
+            "part one\n"
+        );
     }
 
     #[test]
@@ -617,7 +1024,10 @@ mod tests {
 
         let narrower = payload("buzz-coder", vec![file(ROOT_FILE, "---\nname: x\n---\n")]);
         narrower.write_into(root.path()).unwrap();
-        assert!(!stale.exists(), "a dropped part must not survive the replacement");
+        assert!(
+            !stale.exists(),
+            "a dropped part must not survive the replacement"
+        );
         assert!(root.path().join("buzz-coder").join(ROOT_FILE).is_file());
     }
 
@@ -626,7 +1036,12 @@ mod tests {
         // The finding that made this module mostly guards: on PROD the root
         // holds five skills, and reading "replace the directory" as the ROOT
         // would delete four of them on an ordinary successful fetch.
-        let siblings = ["channel-discipline", "fernhill-conventions", "git-workflow", "python-coding"];
+        let siblings = [
+            "channel-discipline",
+            "fernhill-conventions",
+            "git-workflow",
+            "python-coding",
+        ];
         let root = root_with_siblings(&siblings);
         good().write_into(root.path()).unwrap();
         for s in siblings {
@@ -642,7 +1057,11 @@ mod tests {
             .collect();
         names.sort();
         let expected: Vec<String> = [
-            "buzz-coder", "channel-discipline", "fernhill-conventions", "git-workflow", "python-coding",
+            "buzz-coder",
+            "channel-discipline",
+            "fernhill-conventions",
+            "git-workflow",
+            "python-coding",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -661,7 +1080,10 @@ mod tests {
             vec![file(ROOT_FILE, "good"), file("../escape.md", "bad")],
         );
         assert!(poisoned.write_into(root.path()).is_err());
-        assert!(!root.path().join("buzz-coder").exists(), "nothing may be written");
+        assert!(
+            !root.path().join("buzz-coder").exists(),
+            "nothing may be written"
+        );
         assert!(!root.path().join("escape.md").exists());
         assert!(!root.path().parent().unwrap().join("escape.md").exists());
     }
@@ -676,7 +1098,10 @@ mod tests {
         assert!(bad.write_into(root.path()).is_err());
 
         let after = fs::read_to_string(root.path().join("buzz-coder").join(ROOT_FILE)).unwrap();
-        assert_eq!(before, after, "a failed fetch must not degrade a working skill");
+        assert_eq!(
+            before, after,
+            "a failed fetch must not degrade a working skill"
+        );
     }
 
     #[test]
@@ -687,8 +1112,14 @@ mod tests {
         fs::write(staging.join("junk.md"), "from a dead run").unwrap();
 
         good().write_into(root.path()).unwrap();
-        assert!(!staging.exists(), "staging must not survive a successful run");
-        assert!(!root.path().join("buzz-coder/junk.md").exists(), "and must not leak into the skill");
+        assert!(
+            !staging.exists(),
+            "staging must not survive a successful run"
+        );
+        assert!(
+            !root.path().join("buzz-coder/junk.md").exists(),
+            "and must not leak into the skill"
+        );
     }
 
     #[test]
@@ -717,5 +1148,282 @@ mod tests {
         let no_split = r#"{"directory":"d","files":[{"path":"SKILL.md","content":"a"}]}"#;
         let parsed: SkillMd = serde_json::from_str(no_split).unwrap();
         assert!(!parsed.split, "split must default to false");
+    }
+}
+#[cfg(test)]
+mod fetch_tests {
+    use super::*;
+
+    /// Recorded from the live DEV relay on 2026-11-04 as `user_067`, with
+    /// `format="skill_md"`. `composed_markdown` and `parts` are trimmed — the
+    /// client does not read them — everything the client touches is verbatim.
+    const SPLIT: &str = include_str!("../tests/fixtures/assigned_split.json");
+    const SINGLE: &str = include_str!("../tests/fixtures/assigned_single_file.json");
+
+    // ── error_code ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn error_code_reads_the_bracketed_code_behind_the_mcp_prefix() {
+        let text = "Error executing tool get_assigned_skill: [project_not_found]";
+        assert_eq!(error_code(text), Some("project_not_found"));
+    }
+
+    #[test]
+    fn error_code_reads_a_bare_bracketed_code_too() {
+        assert_eq!(error_code("[not_an_agent]"), Some("not_an_agent"));
+    }
+
+    #[test]
+    fn error_code_declines_prose_so_the_caller_carries_it_verbatim() {
+        // The negative control for the three above: text that is NOT in the
+        // documented shape must return None rather than a plausible guess, so
+        // the whole message survives into the operator's log.
+        assert_eq!(error_code("upstream timed out"), None);
+        assert_eq!(error_code("[two words]"), None);
+        assert_eq!(error_code("[]"), None);
+        assert_eq!(error_code("[unterminated"), None);
+    }
+
+    // ── extract_envelope ────────────────────────────────────────────────────
+
+    #[test]
+    fn extract_envelope_reads_plain_json() {
+        let v = extract_envelope(r#"{"jsonrpc":"2.0","id":2,"result":{}}"#).unwrap();
+        assert_eq!(v["id"], 2);
+    }
+
+    #[test]
+    fn extract_envelope_reads_an_sse_frame() {
+        let body =
+            "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"ok\":true}}\n\n";
+        let v = extract_envelope(body).unwrap();
+        assert_eq!(v["result"]["ok"], true);
+    }
+
+    #[test]
+    fn extract_envelope_skips_an_empty_data_line() {
+        let body = "data:\ndata: {\"id\":7}\n";
+        assert_eq!(extract_envelope(body).unwrap()["id"], 7);
+    }
+
+    #[test]
+    fn extract_envelope_names_what_was_wrong() {
+        assert!(extract_envelope("").unwrap_err().contains("empty"));
+        assert!(extract_envelope("   ").unwrap_err().contains("empty"));
+        assert!(extract_envelope("not json")
+            .unwrap_err()
+            .contains("not JSON"));
+        assert!(extract_envelope("event: ping\n")
+            .unwrap_err()
+            .contains("no data frame"));
+        assert!(extract_envelope("data: not json\n")
+            .unwrap_err()
+            .contains("not JSON"));
+    }
+
+    // ── interpret_payload: the two results that are NOT failures ────────────
+
+    #[test]
+    fn no_skill_assigned_is_a_result() {
+        let f = interpret_payload(r#"{"status":"no_skill_assigned"}"#);
+        assert_eq!(f.outcome, FetchOutcome::NoSkillAssigned);
+        assert!(f.skill_md.is_none());
+        // And the whole point of separating it: with no requirement set, this
+        // starts the agent silently.
+        assert_eq!(decide(&f.outcome, false, 0), HarnessAction::StartNormally);
+    }
+
+    #[test]
+    fn skills_disabled_is_a_result() {
+        let f = interpret_payload(r#"{"status":"skills_disabled"}"#);
+        assert_eq!(f.outcome, FetchOutcome::SkillsDisabled);
+        assert_eq!(decide(&f.outcome, true, 0), HarnessAction::StartNormally);
+    }
+
+    // ── interpret_payload: the real payloads ────────────────────────────────
+
+    #[test]
+    fn the_recorded_split_payload_installs_eight_files_in_order() {
+        let f = interpret_payload(SPLIT);
+        assert_eq!(f.outcome, FetchOutcome::Assigned);
+        let skill = f
+            .skill_md
+            .expect("a recorded `assigned` payload carries skill_md");
+        assert_eq!(skill.directory, "buzz-coder");
+        assert!(skill.split);
+        let rels = skill
+            .validate()
+            .expect("the live payload must satisfy the contract");
+        let got: Vec<String> = rels
+            .iter()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                "SKILL.md",
+                "references/working-discipline.md",
+                "references/working-together.md",
+                "references/working-with-engram.md",
+                "references/buzz-coder.md",
+                "references/channel-discipline.md",
+                "references/python-coding.md",
+                "references/git-workflow.md",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_recorded_single_file_payload_installs_one_file() {
+        let f = interpret_payload(SINGLE);
+        assert_eq!(f.outcome, FetchOutcome::Assigned);
+        let skill = f
+            .skill_md
+            .expect("a recorded `assigned` payload carries skill_md");
+        assert!(!skill.split);
+        assert_eq!(skill.files.len(), 1);
+        assert_eq!(skill.files[0].path, "SKILL.md");
+        // The manifest form is the split one; the single file carries the body.
+        assert!(skill.files[0]
+            .content
+            .contains("## Two things you must not do"));
+        assert_eq!(skill.validate().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_split_root_is_a_manifest_that_names_load_skill() {
+        // Why this is asserted rather than assumed: it is the whole reason the
+        // split shape behaves differently in a channel (review §12). If ENGRAM
+        // ever inlines the parts instead, this test is how we find out.
+        let skill = interpret_payload(SPLIT).skill_md.unwrap();
+        let root = &skill.files[0];
+        assert_eq!(root.path, "SKILL.md");
+        assert!(root.content.contains("load_skill"));
+        assert!(root.content.contains("This skill has 7 parts"));
+    }
+
+    // ── interpret_payload: the refusals ─────────────────────────────────────
+
+    #[test]
+    fn assigned_without_skill_md_is_a_failure_not_a_success() {
+        let f = interpret_payload(r#"{"status":"assigned","skill":{"name":"x"}}"#);
+        match f.outcome {
+            FetchOutcome::Failed(why) => assert!(why.contains("no `skill_md`"), "{why}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_missing_status_is_a_failure_rather_than_silence() {
+        match interpret_payload(r#"{"project_id":"project:1"}"#).outcome {
+            FetchOutcome::Failed(why) => assert!(why.contains("`status`"), "{why}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_status_names_the_value() {
+        match interpret_payload(r#"{"status":"on_fire"}"#).outcome {
+            FetchOutcome::Failed(why) => assert!(why.contains("on_fire"), "{why}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_tool_result_wrapped_for_display_does_not_parse_as_assigned() {
+        // The trap this test exists to hold shut: some MCP clients render a
+        // tool result as {"result": "<json string>"}. ENGRAM does not send
+        // that, and a parser written from a client's rendering would look
+        // correct and never match a real response. Refuse it loudly.
+        let display_shape = r#"{"result":"{\"status\":\"assigned\",\"skill_md\":{\"directory\":\"buzz-coder\",\"files\":[{\"path\":\"SKILL.md\",\"content\":\"x\"}]}}"}"#;
+        match interpret_payload(display_shape).outcome {
+            FetchOutcome::Failed(why) => assert!(why.contains("`status`"), "{why}"),
+            other => panic!("a display wrapper must not read as success, got {other:?}"),
+        }
+    }
+
+    // ── interpret_envelope ──────────────────────────────────────────────────
+
+    #[test]
+    fn a_tool_error_becomes_its_bracketed_code() {
+        let env = serde_json::json!({
+            "jsonrpc": "2.0", "id": 2,
+            "result": {
+                "isError": true,
+                "content": [{"type": "text", "text": "Error executing tool get_assigned_skill: [project_not_found]"}]
+            }
+        });
+        assert_eq!(
+            interpret_envelope(&env).outcome,
+            FetchOutcome::Failed("[project_not_found]".to_string())
+        );
+    }
+
+    #[test]
+    fn a_tool_error_without_a_code_keeps_its_whole_text() {
+        let env = serde_json::json!({
+            "result": { "is_error": true, "content": [{"type":"text","text":"upstream exploded"}] }
+        });
+        assert_eq!(
+            interpret_envelope(&env).outcome,
+            FetchOutcome::Failed("upstream exploded".to_string())
+        );
+    }
+
+    #[test]
+    fn a_jsonrpc_error_is_carried_with_its_message() {
+        let env = serde_json::json!({"error": {"code": -32601, "message": "Method not found"}});
+        match interpret_envelope(&env).outcome {
+            FetchOutcome::Failed(why) => assert!(why.contains("Method not found"), "{why}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_envelope_with_neither_result_nor_error_fails() {
+        let env = serde_json::json!({"jsonrpc": "2.0", "id": 2});
+        match interpret_envelope(&env).outcome {
+            FetchOutcome::Failed(why) => assert!(why.contains("neither"), "{why}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_result_with_no_text_block_fails() {
+        let env = serde_json::json!({"result": {"content": [{"type":"image","data":"…"}]}});
+        match interpret_envelope(&env).outcome {
+            FetchOutcome::Failed(why) => assert!(why.contains("no text block"), "{why}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_whole_path_from_an_sse_body_to_an_installable_skill() {
+        // The one test that exercises the real sequence end to end with no
+        // network: SSE body → envelope → tool text → payload → validated paths.
+        let payload: serde_json::Value = serde_json::from_str(SPLIT).unwrap();
+        let body = format!(
+            "event: message\ndata: {}\n\n",
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 2,
+                "result": { "content": [{"type": "text", "text": payload.to_string()}] }
+            })
+        );
+        let env = extract_envelope(&body).expect("the SSE body must yield an envelope");
+        let f = interpret_envelope(&env);
+        assert_eq!(f.outcome, FetchOutcome::Assigned);
+        assert_eq!(decide(&f.outcome, false, 0), HarnessAction::InstallSkill);
+        assert_eq!(f.skill_md.unwrap().validate().unwrap().len(), 8);
+    }
+
+    #[test]
+    fn the_client_builds_and_holds_its_configuration() {
+        let c = EngramSkillClient::new(
+            "https://engram-dev.example/mcp/",
+            "engram_pat_example",
+            Duration::from_secs(10),
+        )
+        .expect("a well-formed client must build");
+        assert_eq!(c.url, "https://engram-dev.example/mcp/");
     }
 }
