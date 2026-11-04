@@ -393,6 +393,13 @@ pub enum HarnessAction {
 
 /// Exponential backoff, capped. Deliberately small and total: a fetch at
 /// session birth must not hold a turn open for minutes.
+///
+/// ⚠️ This is the number of **retries**, not of calls. `decide` retries while
+/// `attempts < FETCH_MAX_ATTEMPTS`, so a fetch that never succeeds makes
+/// `1 + FETCH_MAX_ATTEMPTS` = **4** calls and waits `1 + 4 + 10` = **15
+/// seconds** in total. The 15 seconds is the figure that matters: it is why
+/// this cannot live in the session-birth hook, whose budget is 3 seconds.
+/// `the_ladder_is_four_calls_and_fifteen_seconds` holds both numbers.
 pub const FETCH_MAX_ATTEMPTS: u32 = 3;
 
 fn backoff_secs(attempt: u32) -> u64 {
@@ -750,6 +757,239 @@ impl EngramSkillClient {
 /// The protocol version our handshake declares. Pinned rather than derived: a
 /// version we have not called ENGRAM with is a version we have not tested.
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Item 3 + item 7: the wiring and the policy around it.
+//
+// This runs at PROCESS START, not at session birth. The reason is measured, not
+// stylistic: the session-birth hook in `pool.rs` has a 3-second budget and
+// fails open ("we'd rather start the session with no core hint than block
+// session creation on a stalled relay"), and item 7's backoff ladder is 15
+// seconds, so it cannot live there. And it does not need to: Goose re-reads
+// skill files every turn (review §9), so the WRITE is not bound to a session's
+// lifetime at all.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Everything the fetch needs, read from the environment once.
+#[derive(Debug, Clone)]
+pub struct SkillFetchConfig {
+    pub url: String,
+    /// The agent's own ENGRAM token. Never logged, never put on a command line.
+    pat: String,
+    /// Explicit, never ambient — see `fetch`.
+    pub project: String,
+    /// The directory Goose scans. `<skills_root>/<skill name>` is replaced; the
+    /// root itself is never touched.
+    pub skills_root: PathBuf,
+    /// Mirrors the project's own `require_assigned_skill`. Supplied by config
+    /// rather than read from the payload so the agent's behaviour is decidable
+    /// without a successful fetch — which is exactly the case it governs.
+    pub require_assigned_skill: bool,
+}
+
+impl SkillFetchConfig {
+    /// `Ok(None)` means the switch is off — start normally and say nothing.
+    ///
+    /// `Err` means the switch is ON and the configuration is incomplete. That
+    /// is reported loudly and the agent still starts: an operator's typo must
+    /// not take an agent down, and must not pass unnoticed either.
+    pub fn from_env() -> Result<Option<Self>, String> {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    /// `from_env` over an injected lookup, so every branch is testable without
+    /// mutating the process environment — which is global, and which parallel
+    /// test threads would race on.
+    pub fn from_lookup<F>(get: F) -> Result<Option<Self>, String>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let flag = |name: &str| -> bool {
+            matches!(
+                get(name)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        };
+        let text = |name: &str| -> Option<String> {
+            get(name)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+
+        if !flag("ENGRAM_SKILL_FETCH") {
+            return Ok(None);
+        }
+        let url = text("ENGRAM_MCP_URL")
+            .ok_or("ENGRAM_SKILL_FETCH is on but ENGRAM_MCP_URL is unset or empty")?;
+        let pat = text("ENGRAM_PAT")
+            .ok_or("ENGRAM_SKILL_FETCH is on but ENGRAM_PAT is unset or empty")?;
+        let project = text("ENGRAM_PROJECT").ok_or(
+            "ENGRAM_SKILL_FETCH is on but ENGRAM_PROJECT is unset or empty; an ambient call \
+             returns [project_not_found] as soon as the agent can read more than one project",
+        )?;
+        let skills_root = match text("ENGRAM_SKILL_ROOT") {
+            Some(p) => PathBuf::from(p),
+            None => PathBuf::from(text("HOME").ok_or(
+                "neither ENGRAM_SKILL_ROOT nor HOME is set, so the skills root cannot be resolved",
+            )?)
+            .join(".agents")
+            .join("skills"),
+        };
+        Ok(Some(SkillFetchConfig {
+            url,
+            pat,
+            project,
+            skills_root,
+            require_assigned_skill: flag("ENGRAM_REQUIRE_ASSIGNED_SKILL"),
+        }))
+    }
+
+    pub fn client(&self, timeout: Duration) -> Result<EngramSkillClient, String> {
+        EngramSkillClient::new(self.url.clone(), self.pat.clone(), timeout)
+    }
+}
+
+/// How far a single HTTP call may run. Generous next to the session-birth hook
+/// because nothing is waiting on it: this is process start, off the turn path.
+pub const FETCH_HTTP_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// While degraded, keep trying at this cadence. This is item 7's "refetch when
+/// ENGRAM returns": without it a relay that was down for one minute leaves the
+/// agent on a stale skill until someone restarts it.
+pub const DEGRADED_RETRY_INTERVAL: Duration = Duration::from_secs(300);
+
+/// What the startup fetch settled on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartupOutcome {
+    /// Written. The path is the skill directory, for the log line.
+    Installed(PathBuf),
+    /// Nothing to do, and nothing to say.
+    StartedNormally,
+    /// Up, but without the skill it was supposed to have. Announce and alert.
+    Degraded { reason: String },
+    /// `require_assigned_skill` with no skill: take no tasks, stay up.
+    RefuseTasks { reason: String },
+}
+
+/// Run the fetch under item 7's policy: up to `FETCH_MAX_ATTEMPTS` tries with
+/// the backoff ladder, then install, start quietly, degrade, or refuse.
+///
+/// Generic over the fetch so the ladder is tested against every branch without
+/// a network, with tokio's clock paused.
+pub async fn fetch_with_policy<F, Fut>(cfg: &SkillFetchConfig, mut fetch: F) -> StartupOutcome
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Fetched>,
+{
+    let mut attempts = 0;
+    loop {
+        let fetched = fetch().await;
+        match decide(&fetched.outcome, cfg.require_assigned_skill, attempts) {
+            HarnessAction::InstallSkill => {
+                let Some(skill) = fetched.skill_md else {
+                    // `Assigned` without a payload is refused by
+                    // `interpret_payload`, so this is unreachable through the
+                    // real client. Degrade rather than unwrap: a panic here
+                    // takes down an agent at startup.
+                    return StartupOutcome::Degraded {
+                        reason: "ENGRAM reported a skill but sent no files".to_string(),
+                    };
+                };
+                return match skill.write_into(&cfg.skills_root) {
+                    Ok(path) => StartupOutcome::Installed(path),
+                    // A write failure is NOT retried: the payload was fine and
+                    // the filesystem is not going to change its mind within
+                    // the ladder. The reason names the offending path.
+                    Err(e) => StartupOutcome::Degraded {
+                        reason: e.to_string(),
+                    },
+                };
+            }
+            HarnessAction::StartNormally => return StartupOutcome::StartedNormally,
+            HarnessAction::Retry { delay_secs, .. } => {
+                attempts += 1;
+                tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+            }
+            HarnessAction::DegradedMode { reason } => return StartupOutcome::Degraded { reason },
+            HarnessAction::RefuseTasks { reason } => return StartupOutcome::RefuseTasks { reason },
+        }
+    }
+}
+
+/// The whole startup path: read the config, fetch, write, and log what happened.
+///
+/// Spawned, never awaited by startup. Returns the outcome so a caller that has
+/// a channel can make the item 7 announcement; the process-start site has no
+/// channel, which is why this logs rather than posts.
+pub async fn run_startup_fetch() -> Option<StartupOutcome> {
+    let cfg = match SkillFetchConfig::from_env() {
+        Ok(Some(cfg)) => cfg,
+        // Off. The contract's own instruction for a deliberately disabled
+        // feature: start normally, announce nothing.
+        Ok(None) => return None,
+        Err(why) => {
+            tracing::error!("engram skill fetch is enabled but misconfigured: {why}");
+            return Some(StartupOutcome::Degraded { reason: why });
+        }
+    };
+
+    let client = match cfg.client(FETCH_HTTP_TIMEOUT) {
+        Ok(c) => c,
+        Err(why) => {
+            tracing::error!("engram skill fetch: {why}");
+            return Some(StartupOutcome::Degraded { reason: why });
+        }
+    };
+
+    // The URL and project are logged; the PAT is not, and there is no branch
+    // here that could put it in a line.
+    tracing::info!(
+        url = %cfg.url,
+        project = %cfg.project,
+        skills_root = %cfg.skills_root.display(),
+        "engram skill fetch: starting"
+    );
+
+    let mut outcome = fetch_with_policy(&cfg, || client.fetch(&cfg.project)).await;
+
+    match &outcome {
+        StartupOutcome::Installed(path) => {
+            tracing::info!(path = %path.display(), "engram skill fetch: installed")
+        }
+        StartupOutcome::StartedNormally => {
+            tracing::info!("engram skill fetch: nothing assigned, starting normally")
+        }
+        StartupOutcome::Degraded { reason } => {
+            tracing::error!(reason = %reason, "engram skill fetch: DEGRADED")
+        }
+        StartupOutcome::RefuseTasks { reason } => {
+            tracing::error!(reason = %reason, "engram skill fetch: refusing tasks")
+        }
+    }
+
+    // Item 7's refetch: while degraded, keep trying. A relay that was briefly
+    // down otherwise leaves the agent on a stale skill until a restart.
+    while matches!(
+        outcome,
+        StartupOutcome::Degraded { .. } | StartupOutcome::RefuseTasks { .. }
+    ) {
+        tokio::time::sleep(DEGRADED_RETRY_INTERVAL).await;
+        tracing::info!("engram skill fetch: retrying after degradation");
+        outcome = fetch_with_policy(&cfg, || client.fetch(&cfg.project)).await;
+        if let StartupOutcome::Installed(path) = &outcome {
+            tracing::info!(
+                path = %path.display(),
+                "engram skill fetch: recovered and installed"
+            );
+        }
+    }
+
+    Some(outcome)
+}
 
 #[cfg(test)]
 mod tests {
@@ -1425,5 +1665,323 @@ mod fetch_tests {
         )
         .expect("a well-formed client must build");
         assert_eq!(c.url, "https://engram-dev.example/mcp/");
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn cfg_from(pairs: &[(&str, &str)]) -> Result<Option<SkillFetchConfig>, String> {
+        let map = env(pairs);
+        SkillFetchConfig::from_lookup(|k| map.get(k).cloned())
+    }
+
+    const COMPLETE: &[(&str, &str)] = &[
+        ("ENGRAM_SKILL_FETCH", "1"),
+        ("ENGRAM_MCP_URL", "https://engram-dev.example/mcp/"),
+        ("ENGRAM_PAT", "engram_pat_example"),
+        ("ENGRAM_PROJECT", "project:b5cb944650f21b76"),
+        ("HOME", "/root"),
+    ];
+
+    // ── the switch ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn the_switch_defaults_off() {
+        assert!(cfg_from(&[]).unwrap().is_none());
+    }
+
+    #[test]
+    fn the_switch_is_off_for_anything_that_is_not_an_affirmative() {
+        for v in ["0", "false", "no", "off", "", "maybe", "2"] {
+            let mut pairs = COMPLETE.to_vec();
+            pairs[0] = ("ENGRAM_SKILL_FETCH", v);
+            assert!(
+                cfg_from(&pairs).unwrap().is_none(),
+                "{v:?} must not enable the fetch"
+            );
+        }
+    }
+
+    #[test]
+    fn the_switch_is_on_for_the_four_affirmatives_in_any_case() {
+        for v in ["1", "true", "TRUE", "yes", "On"] {
+            let mut pairs = COMPLETE.to_vec();
+            pairs[0] = ("ENGRAM_SKILL_FETCH", v);
+            assert!(cfg_from(&pairs).unwrap().is_some(), "{v:?} must enable it");
+        }
+    }
+
+    // ── a switch that is on with missing configuration names the key ────────
+
+    #[test]
+    fn each_missing_key_names_itself() {
+        for (missing, expect) in [
+            ("ENGRAM_MCP_URL", "ENGRAM_MCP_URL"),
+            ("ENGRAM_PAT", "ENGRAM_PAT"),
+            ("ENGRAM_PROJECT", "ENGRAM_PROJECT"),
+        ] {
+            let pairs: Vec<(&str, &str)> = COMPLETE
+                .iter()
+                .copied()
+                .filter(|(k, _)| *k != missing)
+                .collect();
+            let err = cfg_from(&pairs).expect_err("an incomplete config must be an error");
+            assert!(err.contains(expect), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_whitespace_only_value_counts_as_missing() {
+        let mut pairs = COMPLETE.to_vec();
+        pairs[3] = ("ENGRAM_PROJECT", "   ");
+        assert!(cfg_from(&pairs).unwrap_err().contains("ENGRAM_PROJECT"));
+    }
+
+    #[test]
+    fn the_project_error_explains_why_an_ambient_call_will_not_do() {
+        let pairs: Vec<(&str, &str)> = COMPLETE
+            .iter()
+            .copied()
+            .filter(|(k, _)| *k != "ENGRAM_PROJECT")
+            .collect();
+        let err = cfg_from(&pairs).unwrap_err();
+        assert!(err.contains("project_not_found"), "{err}");
+    }
+
+    // ── the skills root ────────────────────────────────────────────────────
+
+    #[test]
+    fn the_skills_root_defaults_under_home() {
+        let cfg = cfg_from(COMPLETE).unwrap().unwrap();
+        assert_eq!(cfg.skills_root, PathBuf::from("/root/.agents/skills"));
+    }
+
+    #[test]
+    fn an_explicit_skills_root_wins_over_home() {
+        let mut pairs = COMPLETE.to_vec();
+        pairs.push(("ENGRAM_SKILL_ROOT", "/srv/skills"));
+        let cfg = cfg_from(&pairs).unwrap().unwrap();
+        assert_eq!(cfg.skills_root, PathBuf::from("/srv/skills"));
+    }
+
+    #[test]
+    fn without_home_or_an_explicit_root_the_config_refuses() {
+        let pairs: Vec<(&str, &str)> = COMPLETE
+            .iter()
+            .copied()
+            .filter(|(k, _)| *k != "HOME")
+            .collect();
+        assert!(cfg_from(&pairs).unwrap_err().contains("skills root"));
+    }
+
+    #[test]
+    fn require_assigned_skill_is_off_unless_asked_for() {
+        assert!(!cfg_from(COMPLETE).unwrap().unwrap().require_assigned_skill);
+        let mut pairs = COMPLETE.to_vec();
+        pairs.push(("ENGRAM_REQUIRE_ASSIGNED_SKILL", "yes"));
+        assert!(cfg_from(&pairs).unwrap().unwrap().require_assigned_skill);
+    }
+
+    // ── fetch_with_policy: the ladder ──────────────────────────────────────
+
+    fn test_cfg(root: &Path, require: bool) -> SkillFetchConfig {
+        SkillFetchConfig {
+            url: "https://engram-dev.example/mcp/".to_string(),
+            pat: "engram_pat_example".to_string(),
+            project: "project:test".to_string(),
+            skills_root: root.to_path_buf(),
+            require_assigned_skill: require,
+        }
+    }
+
+    fn assigned() -> Fetched {
+        interpret_payload(include_str!("../tests/fixtures/assigned_split.json"))
+    }
+
+    /// A fetch that returns a scripted sequence and counts its calls.
+    struct Script {
+        answers: RefCell<Vec<Fetched>>,
+        calls: RefCell<usize>,
+    }
+
+    impl Script {
+        fn new(answers: Vec<Fetched>) -> Self {
+            Script {
+                answers: RefCell::new(answers),
+                calls: RefCell::new(0),
+            }
+        }
+        fn next(&self) -> Fetched {
+            *self.calls.borrow_mut() += 1;
+            let mut a = self.answers.borrow_mut();
+            if a.is_empty() {
+                Fetched::failed("script exhausted")
+            } else {
+                a.remove(0)
+            }
+        }
+        fn calls(&self) -> usize {
+            *self.calls.borrow()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_assigned_payload_is_written_on_the_first_attempt() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(root.path(), false);
+        let script = Script::new(vec![assigned()]);
+        let out = fetch_with_policy(&cfg, || async { script.next() }).await;
+        assert_eq!(
+            out,
+            StartupOutcome::Installed(root.path().join("buzz-coder"))
+        );
+        assert_eq!(script.calls(), 1, "a success must not retry");
+        assert!(root.path().join("buzz-coder/SKILL.md").is_file());
+        assert!(root
+            .path()
+            .join("buzz-coder/references/git-workflow.md")
+            .is_file());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn two_failures_then_a_success_still_installs() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(root.path(), false);
+        let script = Script::new(vec![
+            Fetched::failed("transport: connection refused"),
+            Fetched::failed("transport: connection refused"),
+            assigned(),
+        ]);
+        let out = fetch_with_policy(&cfg, || async { script.next() }).await;
+        assert!(matches!(out, StartupOutcome::Installed(_)), "{out:?}");
+        assert_eq!(script.calls(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_ladder_is_four_calls_and_fifteen_seconds() {
+        // Written expecting THREE calls, because the constant is called
+        // FETCH_MAX_ATTEMPTS. It is the retry count: `decide` retries while
+        // `attempts < FETCH_MAX_ATTEMPTS`, so the initial call plus three
+        // retries is four. Both numbers are asserted here so the next reader
+        // does not have to re-derive them -- and the 15 seconds is the figure
+        // that rules out the session-birth hook.
+        let root = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(root.path(), false);
+        let script = Script::new(vec![
+            Fetched::failed("transport: timed out"),
+            Fetched::failed("transport: timed out"),
+            Fetched::failed("transport: timed out"),
+            Fetched::failed("transport: timed out"),
+        ]);
+        let started = tokio::time::Instant::now();
+        let out = fetch_with_policy(&cfg, || async { script.next() }).await;
+        let waited = started.elapsed();
+
+        match out {
+            StartupOutcome::Degraded { reason } => {
+                assert!(reason.contains("timed out"), "{reason}")
+            }
+            other => panic!("expected Degraded, got {other:?}"),
+        }
+        assert_eq!(
+            script.calls(),
+            1 + FETCH_MAX_ATTEMPTS as usize,
+            "the ladder is the initial call plus FETCH_MAX_ATTEMPTS retries"
+        );
+        assert_eq!(waited, Duration::from_secs(15), "1 + 4 + 10");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_exhausted_ladder_under_a_requirement_refuses_rather_than_degrading() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(root.path(), true);
+        let script = Script::new(vec![
+            Fetched::failed("transport: timed out"),
+            Fetched::failed("transport: timed out"),
+            Fetched::failed("transport: timed out"),
+            Fetched::failed("transport: timed out"),
+        ]);
+        match fetch_with_policy(&cfg, || async { script.next() }).await {
+            StartupOutcome::RefuseTasks { reason } => {
+                assert!(reason.contains("require_assigned_skill"), "{reason}")
+            }
+            other => panic!("expected RefuseTasks, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nothing_assigned_starts_quietly_and_writes_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(root.path(), false);
+        let script = Script::new(vec![Fetched::plain(FetchOutcome::NoSkillAssigned)]);
+        let out = fetch_with_policy(&cfg, || async { script.next() }).await;
+        assert_eq!(out, StartupOutcome::StartedNormally);
+        assert_eq!(script.calls(), 1, "a result must not retry");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nothing_assigned_under_a_requirement_refuses_tasks() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(root.path(), true);
+        let script = Script::new(vec![Fetched::plain(FetchOutcome::NoSkillAssigned)]);
+        match fetch_with_policy(&cfg, || async { script.next() }).await {
+            StartupOutcome::RefuseTasks { .. } => {}
+            other => panic!("expected RefuseTasks, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn skills_disabled_outranks_a_requirement() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(root.path(), true);
+        let script = Script::new(vec![Fetched::plain(FetchOutcome::SkillsDisabled)]);
+        assert_eq!(
+            fetch_with_policy(&cfg, || async { script.next() }).await,
+            StartupOutcome::StartedNormally
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_write_failure_degrades_naming_the_path_and_does_not_retry() {
+        // The negative control for the install branch: the payload is perfect
+        // and the filesystem refuses. Retrying would not help, so it must not.
+        let root = tempfile::tempdir().unwrap();
+        let blocked = root.path().join("not-a-dir");
+        std::fs::write(&blocked, b"i am a file").unwrap();
+        let cfg = test_cfg(&blocked, false);
+        let script = Script::new(vec![assigned()]);
+        match fetch_with_policy(&cfg, || async { script.next() }).await {
+            StartupOutcome::Degraded { reason } => {
+                assert!(!reason.is_empty(), "a write failure must name something")
+            }
+            other => panic!("expected Degraded, got {other:?}"),
+        }
+        assert_eq!(script.calls(), 1, "a write failure must not retry");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn assigned_with_no_files_degrades_rather_than_panicking() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(root.path(), false);
+        let script = Script::new(vec![Fetched {
+            outcome: FetchOutcome::Assigned,
+            skill_md: None,
+        }]);
+        match fetch_with_policy(&cfg, || async { script.next() }).await {
+            StartupOutcome::Degraded { reason } => assert!(reason.contains("no files"), "{reason}"),
+            other => panic!("expected Degraded, got {other:?}"),
+        }
     }
 }

@@ -2541,6 +2541,22 @@ async fn tokio_main() -> Result<()> {
         return setup_mode::run_setup_listener(config, payload).await;
     }
 
+    // ── B2: this agent's assigned skill, fetched from ENGRAM ──────────────────
+    //
+    // At PROCESS START, spawned and never awaited. Two reasons it is here and
+    // not at session birth: the session-birth hook has a 3-second budget and
+    // fails open, which item 7's 15-second backoff ladder cannot fit inside;
+    // and Goose re-reads skill files every turn (review §9), so the write is
+    // not bound to a session's lifetime. Behind `ENGRAM_SKILL_FETCH`, default
+    // off — with the switch unset this spawns a task that reads one env var and
+    // returns.
+    //
+    // It is deliberately AFTER the setup-mode branch: a setup listener has no
+    // agent to give a skill to.
+    tokio::spawn(async {
+        engram_skill::run_startup_fetch().await;
+    });
+
     // Register termination before creating temporary key material or spawning
     // adapters. During startup cancellation drops the pool and key guard; once
     // ready, the existing main-loop shutdown drains active work first.
