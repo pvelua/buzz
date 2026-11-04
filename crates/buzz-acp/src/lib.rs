@@ -7,6 +7,11 @@ mod git_runtime_tests;
 mod acp;
 mod config;
 mod engram_fetch;
+// B2 item 6: the writer is complete and tested, but nothing calls it until the
+// fetch and the session-birth wiring land, so its items are legitimately dead
+// code for now. Stated here rather than left as warnings.
+#[allow(dead_code)]
+mod engram_skill;
 mod filter;
 mod isolated_execution;
 mod observer;
