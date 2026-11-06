@@ -992,6 +992,7 @@ pub async fn run_startup_fetch() -> Option<StartupOutcome> {
     match &outcome {
         StartupOutcome::Installed { path, skill } => {
             record_installed(skill.clone());
+            clear_degraded();
             tracing::info!(
                 path = %path.display(),
                 parts = skill.references.len(),
@@ -999,12 +1000,16 @@ pub async fn run_startup_fetch() -> Option<StartupOutcome> {
             )
         }
         StartupOutcome::StartedNormally => {
+            // Includes `no_skill_assigned`, which is a RESULT and never degraded.
+            clear_degraded();
             tracing::info!("engram skill fetch: nothing assigned, starting normally")
         }
         StartupOutcome::Degraded { reason } => {
+            record_degraded(reason.clone());
             tracing::error!(reason = %reason, "engram skill fetch: DEGRADED")
         }
         StartupOutcome::RefuseTasks { reason } => {
+            record_degraded(reason.clone());
             tracing::error!(reason = %reason, "engram skill fetch: refusing tasks")
         }
     }
@@ -1020,6 +1025,9 @@ pub async fn run_startup_fetch() -> Option<StartupOutcome> {
         outcome = fetch_with_policy(&cfg, || client.fetch(&cfg.project)).await;
         if let StartupOutcome::Installed { path, skill } = &outcome {
             record_installed(skill.clone());
+            // Clears the marker, so the next wake in a channel that was told
+            // carries the recovery line rather than silence.
+            clear_degraded();
             tracing::info!(
                 path = %path.display(),
                 "engram skill fetch: recovered and installed"
@@ -1087,6 +1095,16 @@ pub fn installed_skill() -> Option<InstalledSkill> {
 /// `<assigned-skill>` section, and the bootstrap is composed **once** at
 /// session birth.
 ///
+/// ⚠⚠ **The 4.2 s is DEV's, and PROD measured it SMALLER and sometimes
+/// NEGATIVE** (2026-11-06, one bring-up of all three agents): the skill landed
+/// **524 ms after** the coder came online, and **131 ms and 164 ms BEFORE** the
+/// researcher and the orchestrator did. So this is a **race between the fetch
+/// and the relay connect sequence with no ordering guarantee**, decided by
+/// whether the fetch takes ~160 ms or ~850 ms — not a window of known width or
+/// even of known sign. Two consequences: the exposure can be **zero** for an
+/// agent whose fetch wins, and the counter below will therefore fire far less
+/// on PROD than on DEV, so a low count there is not evidence the window closed.
+///
 /// The exposure is narrower than it looks: Goose re-reads skill *files* every
 /// turn, so such a session still gets the files from its next turn. What it
 /// misses for its whole life is the *instruction to load them* — which is
@@ -1147,6 +1165,223 @@ pub fn bootstrap_text(skill: Option<&InstalledSkill>) -> Option<String> {
         out.push_str(&format!("\n- load_skill(name: \"{dir}/{reference}\")"));
     }
     Some(out)
+}
+
+// ── Option A: the degraded-mode announcement (item 7, §7b) ─────────────────
+//
+// D20 asks for *"a marked degraded mode — an in-channel announcement that the
+// assigned skill is unavailable and why"*. The obstacle is structural: the fetch
+// runs at **process start, and process start has no channel.** The agent has not
+// joined a session and does not know which rooms it will be addressed in, so
+// announcing at the moment of failure means announcing nowhere.
+//
+// Igor chose **option A with option B's phrasing** (2026-11-05): announce **once
+// per channel**, the first time the agent is woken there while degraded, with
+// wording that says both what is degraded *and* that work continues.
+//
+// Four guards, each for a mistake that is easy to make here:
+//
+// 1. **Never on `no_skill_assigned`.** That is a *result*, not a failure — DEV
+//    returns it today — and announcing it would put a healthy agent into a
+//    visible degraded mode (§8.1 finding 3). This falls out of keying the
+//    announcement on an explicit degraded marker rather than on "no skill
+//    installed", which is also true when nothing was ever assigned.
+// 2. **Not during the startup window**, however wide it turns out to be. The
+//    same marker handles it: while the fetch is in flight it has neither
+//    succeeded nor exhausted its retries, so the marker is unset and nothing is
+//    said. Note `fetch_pending()` could NOT be used as the discriminator — it
+//    is true both in flight and after failure.
+//
+//    ⚠️ **Do not re-derive this guard from a gap of 4.2 s.** That figure is
+//    DEV's; PROD measured **+524 ms, −131 ms and −164 ms** across one bring-up
+//    of the three agents (2026-11-06), so the skill can land *before* the agent
+//    is online and the gap has no guaranteed sign. **This guard is correct
+//    because it keys on the marker rather than on a time window** — which is
+//    precisely what makes it survive a measurement that moved.
+// 3. **Once per channel, not once per session.** `session_policy=channel` makes
+//    those nearly the same; the flag makes it exact across session recycling.
+// 4. **No mentions, and no thread.** The relay parses `@Name` out of the message
+//    **body** into `p` tags, and a `p` tag *wakes* its subject — so an
+//    announcement that named the room would spend a real model turn per member
+//    to tell them something they never asked about. It is a top-level post, not
+//    a reply, so it carries no thread tags either.
+//
+// One addition beyond the three options as written: **when the refetch loop
+// recovers, the channels that were told are told once more.** Without it, a room
+// that saw the announcement believes the agent is degraded forever — which §7b's
+// table listed as option A's cost. This is the answer to that cost.
+
+/// Set while the fetch has failed its last retry; cleared when a later fetch
+/// installs a skill. `None` means "not degraded", which is **not** the same as
+/// "no skill installed" — see guard 1.
+static DEGRADED: std::sync::OnceLock<std::sync::RwLock<Option<String>>> =
+    std::sync::OnceLock::new();
+
+fn degraded_slot() -> &'static std::sync::RwLock<Option<String>> {
+    DEGRADED.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+/// Channels that have been told, and not yet told of a recovery.
+static TOLD: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+fn told_slot() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    TOLD.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+pub fn record_degraded(reason: impl Into<String>) {
+    if let Ok(mut slot) = degraded_slot().write() {
+        *slot = Some(reason.into());
+    }
+}
+
+pub fn clear_degraded() {
+    if let Ok(mut slot) = degraded_slot().write() {
+        *slot = None;
+    }
+}
+
+pub fn degraded_reason() -> Option<String> {
+    degraded_slot().read().ok().and_then(|slot| slot.clone())
+}
+
+/// What, if anything, to say in a channel right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Announcement {
+    /// First wake in this channel while degraded.
+    Degraded { reason: String },
+    /// The skill arrived after this channel had been told it was missing.
+    Recovered,
+}
+
+/// The policy, over explicit inputs so every branch is testable without the
+/// process-wide slots.
+pub fn decide_announcement(degraded: Option<&str>, already_told: bool) -> Option<Announcement> {
+    match (degraded, already_told) {
+        // Degraded and this room does not know yet.
+        (Some(reason), false) => Some(Announcement::Degraded {
+            reason: reason.to_string(),
+        }),
+        // Degraded and already said so: silence. Guard 3.
+        (Some(_), true) => None,
+        // Recovered, and this room was told. Close the loop.
+        (None, true) => Some(Announcement::Recovered),
+        // Healthy, nothing said: the overwhelmingly common case, and it must
+        // cost nothing. Guards 1 and 2 both land here.
+        (None, false) => None,
+    }
+}
+
+/// A cheap pre-check for the inbound path, which runs on **every accepted
+/// event**. The steady state is a healthy agent with nothing to say, and that
+/// case must cost two lock reads and no task — not a spawned future per event.
+pub fn announcement_possible() -> bool {
+    degraded_reason().is_some()
+        || told_slot()
+            .lock()
+            .map(|told| !told.is_empty())
+            .unwrap_or(false)
+}
+
+/// `decide_announcement` against the process-wide state, recording what was
+/// said so it is not said twice.
+pub fn announcement_for(channel: &str) -> Option<Announcement> {
+    let degraded = degraded_reason();
+    let mut told = told_slot().lock().ok()?;
+    let decision = decide_announcement(degraded.as_deref(), told.contains(channel));
+    match &decision {
+        Some(Announcement::Degraded { .. }) => {
+            told.insert(channel.to_string());
+        }
+        Some(Announcement::Recovered) => {
+            told.remove(channel);
+        }
+        None => {}
+    }
+    decision
+}
+
+/// The message body. Option B's phrasing, chosen because it says **what is
+/// degraded** and **that work continues** — a room told only the first will
+/// either escalate or stop asking.
+///
+/// ⚠️ Deliberately NOT pinned to a golden fixture, unlike `bootstrap_text`.
+/// That one is pinned because its wording was *measured* at 6-of-6 against
+/// 1-of-4; this wording has no such measurement behind it, and pinning it
+/// byte-for-byte would imply evidence that does not exist. The tests assert the
+/// load-bearing clauses instead.
+pub fn announcement_body(a: &Announcement) -> String {
+    match a {
+        Announcement::Degraded { reason } => format!(
+            "I am running without my assigned skill — I could not fetch it from ENGRAM \
+             ({reason}). I will answer from my general instructions and pick the skill up \
+             automatically once ENGRAM is reachable again. Until then, treat my answers here \
+             as missing this project's specific conventions."
+        ),
+        // ⚠️ Deliberately neutral about the skill itself. The retry loop can go
+        // from Degraded to `no_skill_assigned` -- ENGRAM reachable again, nothing
+        // assigned -- and "my skill has arrived" would then be a false statement
+        // to the room. What recovered is the REACHABILITY, which is what the
+        // degraded note actually claimed was broken.
+        Announcement::Recovered => "ENGRAM is reachable again, so the degraded note \
+             above no longer applies."
+            .to_string(),
+    }
+}
+
+/// Publisher + keys, stored once at startup for the same reason `INSTALLED` is:
+/// the fetch outcome is process-wide, and the place that needs to *say* so is
+/// the inbound path, which has a channel but no relay handle.
+pub struct Announcer {
+    publisher: crate::relay::RelayEventPublisher,
+    keys: nostr::Keys,
+}
+
+static ANNOUNCER: std::sync::OnceLock<Announcer> = std::sync::OnceLock::new();
+
+/// Idempotent: a second call is ignored rather than panicking, because the
+/// caller is a startup path that a reconnect may run twice.
+pub fn record_announcer(publisher: crate::relay::RelayEventPublisher, keys: nostr::Keys) {
+    let _ = ANNOUNCER.set(Announcer { publisher, keys });
+}
+
+/// Say it, if there is anything to say. Called from the inbound path with the
+/// channel the agent was woken in.
+///
+/// Never returns an error: a failed announcement must not cost the turn the
+/// agent was woken for. It logs, because an announcement that cannot be posted
+/// is exactly the condition an operator needs to know about.
+pub async fn maybe_announce(channel_id: uuid::Uuid) {
+    let Some(a) = announcement_for(&channel_id.to_string()) else {
+        return;
+    };
+    let Some(announcer) = ANNOUNCER.get() else {
+        tracing::warn!(
+            channel = %channel_id,
+            "degraded announcement decided but no announcer is registered; nothing was posted"
+        );
+        return;
+    };
+    let body = announcement_body(&a);
+    // No thread ref and NO mentions -- guard 4.
+    let built = match buzz_sdk::build_message(channel_id, &body, None, &[], false, &[], &[]) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not build the degraded announcement");
+            return;
+        }
+    };
+    match built.sign_with_keys(&announcer.keys) {
+        Ok(signed) => match announcer.publisher.publish_event(signed).await {
+            Ok(_) => tracing::info!(
+                channel = %channel_id,
+                recovered = matches!(a, Announcement::Recovered),
+                "degraded announcement posted"
+            ),
+            Err(e) => tracing::warn!(error = %e, "could not publish the degraded announcement"),
+        },
+        Err(e) => tracing::warn!(error = %e, "could not sign the degraded announcement"),
+    }
 }
 
 #[cfg(test)]
@@ -2269,4 +2504,139 @@ mod bootstrap_tests {
     // nothing has been recorded yet". A test would have to set a process-wide
     // flag that then stays set for every test that runs after it, and the only
     // thing it gates is a `tracing::warn!`. Not worth the fragility.
+}
+
+#[cfg(test)]
+mod announcement_tests {
+    use super::*;
+
+    /// The two tests below drive the **process-wide** slots, and `cargo test`
+    /// runs them on different threads in one binary.
+    ///
+    /// ⚠️ Naming distinct channels per test is NOT enough, which is how this
+    /// was first written and how it failed: `TOLD` is per channel but
+    /// `DEGRADED` is one global marker, so `record_degraded` in either test
+    /// made the other's "healthy: silence" assertion flap. Serialise them.
+    static STATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Takes the lock without caring whether a previous panic poisoned it: a
+    /// failing test should report its own assertion, not drag the next one down
+    /// with a poison error that hides it.
+    fn state_guard() -> std::sync::MutexGuard<'static, ()> {
+        STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    // Guard 1 and guard 2 share a branch, and that is the point: keying on an
+    // explicit degraded marker makes "nothing assigned" and "still in flight"
+    // both silent without either needing its own check.
+    #[test]
+    fn a_healthy_agent_says_nothing_however_often_it_is_woken() {
+        assert_eq!(decide_announcement(None, false), None);
+        assert_eq!(decide_announcement(None, false), None);
+    }
+
+    #[test]
+    fn a_degraded_agent_tells_a_room_that_does_not_know() {
+        assert_eq!(
+            decide_announcement(Some("engram unreachable"), false),
+            Some(Announcement::Degraded {
+                reason: "engram unreachable".into()
+            })
+        );
+    }
+
+    #[test]
+    fn it_does_not_tell_the_same_room_twice() {
+        assert_eq!(decide_announcement(Some("engram unreachable"), true), None);
+    }
+
+    #[test]
+    fn recovery_is_announced_only_where_the_degradation_was() {
+        assert_eq!(decide_announcement(None, true), Some(Announcement::Recovered));
+        // A room never told is never told of a recovery either -- otherwise the
+        // first thing a quiet room hears is that something it never knew was
+        // broken is fixed.
+        assert_eq!(decide_announcement(None, false), None);
+    }
+
+    #[test]
+    fn the_degraded_body_says_what_is_wrong_and_that_work_continues() {
+        let body = announcement_body(&Announcement::Degraded {
+            reason: "connection refused".into(),
+        });
+        // Option B's phrasing is load-bearing in three clauses.
+        assert!(body.contains("without my assigned skill"), "{body}");
+        assert!(body.contains("connection refused"), "the reason must reach the room: {body}");
+        assert!(
+            body.contains("I will answer") && body.contains("automatically"),
+            "it must say work continues and that recovery needs no human: {body}"
+        );
+        // Guard 4 is about tags, which the relay parses out of the BODY. An '@'
+        // here would wake whoever it named.
+        assert!(!body.contains('@'), "the announcement must mention nobody: {body}");
+    }
+
+    #[test]
+    fn the_recovery_body_claims_reachability_rather_than_a_skill() {
+        let body = announcement_body(&Announcement::Recovered);
+        assert!(body.contains("reachable again"), "{body}");
+        // The retry loop can recover into `no_skill_assigned`, where a claim
+        // that the skill arrived would be false.
+        assert!(
+            !body.to_lowercase().contains("arrived"),
+            "must not claim the skill itself is in place: {body}"
+        );
+        assert!(!body.contains('@'), "{body}");
+    }
+
+    #[test]
+    fn the_per_channel_state_round_trips() {
+        let _serialised = state_guard();
+        let ch = "round-trip-channel-a";
+        clear_degraded();
+        told_slot().lock().unwrap().remove(ch);
+
+        assert_eq!(announcement_for(ch), None, "healthy: silence");
+
+        record_degraded("engram timed out");
+        match announcement_for(ch) {
+            Some(Announcement::Degraded { reason }) => assert_eq!(reason, "engram timed out"),
+            other => panic!("expected a degraded announcement, got {other:?}"),
+        }
+        assert_eq!(announcement_for(ch), None, "and not a second time");
+
+        clear_degraded();
+        assert_eq!(
+            announcement_for(ch),
+            Some(Announcement::Recovered),
+            "the room that was told is told of the recovery"
+        );
+        assert_eq!(announcement_for(ch), None, "once, then silence again");
+    }
+
+    #[test]
+    fn one_room_being_told_does_not_speak_for_another() {
+        let _serialised = state_guard();
+        let a = "independent-channel-a";
+        let b = "independent-channel-b";
+        clear_degraded();
+        {
+            let mut told = told_slot().lock().unwrap();
+            told.remove(a);
+            told.remove(b);
+        }
+        record_degraded("engram unreachable");
+        assert!(matches!(
+            announcement_for(a),
+            Some(Announcement::Degraded { .. })
+        ));
+        // b has not been woken yet; it must still get its own announcement.
+        assert!(
+            matches!(announcement_for(b), Some(Announcement::Degraded { .. })),
+            "an agent in five channels announces in each -- once"
+        );
+        clear_degraded();
+        told_slot().lock().unwrap().remove(a);
+        told_slot().lock().unwrap().remove(b);
+    }
 }

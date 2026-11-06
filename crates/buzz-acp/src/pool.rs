@@ -1503,6 +1503,10 @@ async fn create_session_and_apply_model(
     let assigned_skill_bootstrap = crate::engram_skill::bootstrap_instruction();
     if assigned_skill_bootstrap.is_none() && crate::engram_skill::fetch_pending() {
         // The startup window, measured on DEV at 4.2s: online before skilled.
+        // ⚠️ PROD, 2026-11-06: +524 ms for the coder but −131 ms and −164 ms for
+        // the researcher and orchestrator -- the skill landed FIRST for two of
+        // three, so there was no window at all for them. It is a race, not a
+        // fixed gap, so a low count here on PROD does not mean it was closed.
         // This session will carry no load instruction for its whole life, even
         // though the files arrive moments later. Counting it is how we learn
         // whether it is worth closing -- see `engram_skill::fetch_pending`.

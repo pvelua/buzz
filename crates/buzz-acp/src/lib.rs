@@ -690,6 +690,14 @@ impl NormalListenerIngress {
         let event_for_steer = buzz_event.event.clone();
         let prompt_tag_for_steer = prompt_tag.clone();
         let channel_id = buzz_event.channel_id;
+        // Option A: the first time we are woken in a room while degraded, say so
+        // there -- once. SPAWNED and never awaited, because an announcement must
+        // not delay the turn it accompanies, and a relay that is slow to accept
+        // it must not make the agent look slow to answer. Guarded by a cheap
+        // check so the healthy steady state spawns nothing.
+        if engram_skill::announcement_possible() {
+            tokio::spawn(engram_skill::maybe_announce(channel_id));
+        }
         let accepted = queue.push(QueuedEvent {
             channel_id,
             scope: session_scope.clone(),
@@ -2689,6 +2697,17 @@ async fn run_harness(
 
     let presence_publisher = relay.event_publisher();
     let presence_keys = config.keys.clone();
+
+    // ── Option A's announcer (see engram_skill, §7b) ───────────────────────
+    // The degraded announcement is decided on the INBOUND path, which knows the
+    // channel and holds no relay handle; the fetch that knows about the failure
+    // runs at process start and knows no channel. So the handle is registered
+    // here, for the same reason `INSTALLED` is process-wide.
+    //
+    // Registered unconditionally and harmlessly: the policy is silent unless a
+    // fetch has actually failed its last retry, so on an agent with the switch
+    // off this costs one `OnceLock` write and nothing else, ever.
+    engram_skill::record_announcer(relay.event_publisher(), config.keys.clone());
 
     // Priority: BUZZ_AUTH_TAG (NIP-OA attestation) → --agent-owner flag.
     let startup_owner: Option<String> = resolve_agent_owner(config);
