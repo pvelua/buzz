@@ -376,6 +376,17 @@ mod inbound_author_gate {
         pub(crate) fn into_parts(self) -> (relay::BuzzEvent, String) {
             (self.buzz_event, self.effective_author)
         }
+
+        /// Read-only access, for a pre-turn dispatch (B3).
+        ///
+        /// ⚠️ This does **not** weaken the capability above. The point of the
+        /// private field is that the event cannot be *used or published*
+        /// without consuming the verdict; a borrow cannot be signed, queued or
+        /// replied to. B3 needs to look at an authorized event before deciding
+        /// it should never become a turn, and looking is all this allows.
+        pub(crate) fn peek(&self) -> (&relay::BuzzEvent, &str) {
+            (&self.buzz_event, &self.effective_author)
+        }
     }
 
     /// Apply the configured raw-author policy after trusted workflow attribution.
@@ -2817,6 +2828,21 @@ async fn run_harness(
     tracing::info!("discovered {} channel(s)", channel_info_map.len());
     let channel_ids: Vec<Uuid> = channel_info_map.keys().copied().collect();
 
+    // B3 / D19: the seam adapter's key, read once. `None` disables the skill
+    // doorbell dispatch entirely, which is the pre-v1.3.0 behaviour and a
+    // valid configuration -- not an error.
+    let seam_pubkey = engram_skill::seam_pubkey_from_env();
+    match seam_pubkey.as_deref() {
+        Some(pin) => tracing::info!(
+            seam = &pin[..pin.len().min(12)],
+            "skill doorbell dispatch: enabled"
+        ),
+        None => tracing::info!(
+            "skill doorbell dispatch: disabled (ENGRAM_SEAM_PUBKEY unset); a skill doorbell \
+             will reach the model instead"
+        ),
+    }
+
     let rules: Vec<SubscriptionRule> = match config.subscribe_mode {
         SubscribeMode::Mentions => {
             vec![SubscriptionRule {
@@ -3598,6 +3624,51 @@ async fn run_harness(
                             else {
                                 continue;
                             };
+                            // B3 / D19: a skill doorbell is consumed BELOW the
+                            // model. It is recognised here, after the author
+                            // gate and before the subscription match, because
+                            // the thing that must act on it is the harness --
+                            // and if the model saw it, the `action` naming
+                            // `get_assigned_skill` would quite reasonably
+                            // invite it to call that tool itself, pulling the
+                            // whole composed skill into a session's context as
+                            // prompt text. That is the delivery mode ENGRAM's
+                            // design rejected, and the model cannot do the part
+                            // that matters anyway: the atomic directory swap.
+                            if let Some(pin) = seam_pubkey.as_deref() {
+                                let (peeked, author) = authorized_event.peek();
+                                let doorbell = engram_skill::skill_doorbell_from_adapter(
+                                    pin,
+                                    author,
+                                    &peeked.event.content,
+                                )
+                                .filter(|_| {
+                                    // ⚠️ The adapter rings ONE agent per
+                                    // doorbell and our agents share rooms, so
+                                    // without this the researcher would rewrite
+                                    // its skill because the coder was rung.
+                                    event_mentions_agent(&peeked.event, &pubkey_hex)
+                                });
+                                if let Some(doorbell) = doorbell {
+                                    let event_id = peeked.event.id.to_hex();
+                                    let rest_client = ctx.rest_client.clone();
+                                    // Spawned: the refetch runs the backoff
+                                    // ladder, so awaiting it here would hold
+                                    // the inbound loop for up to 15 seconds and
+                                    // stall every other channel.
+                                    tokio::spawn(async move {
+                                        let outcome =
+                                            engram_skill::handle_skill_doorbell(&doorbell).await;
+                                        if let Some(emoji) =
+                                            engram_skill::doorbell_receipt(&outcome)
+                                        {
+                                            pool::reaction_add(&rest_client, &event_id, emoji)
+                                                .await;
+                                        }
+                                    });
+                                    continue;
+                                }
+                            }
                             let Some(ingress) =
                                 AuthorizedNormalListenerEvent(authorized_event)
                                     .match_subscription(&rules, &pubkey_hex)
@@ -6078,7 +6149,7 @@ mod refusal_gate_tests {
     /// like a failure of the gate.
     #[tokio::test]
     async fn a_refusing_agent_queues_nothing_while_a_degraded_one_still_works() {
-        let _serialised = engram_skill::state_test_guard();
+        let _serialised = engram_skill::state_test_guard_async().await;
         engram_skill::clear_trouble();
 
         let channel_id = Uuid::new_v4();

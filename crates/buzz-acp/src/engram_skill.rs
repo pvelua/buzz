@@ -1072,9 +1072,10 @@ pub struct SkillFetchConfig {
     /// The directory Goose scans. `<skills_root>/<skill name>` is replaced; the
     /// root itself is never touched.
     pub skills_root: PathBuf,
-    /// Mirrors the project's own `require_assigned_skill`. Supplied by config
-    /// rather than read from the payload so the agent's behaviour is decidable
-    /// without a successful fetch — which is exactly the case it governs.
+    /// Mirrors the project's own `require_assigned_skill`. ⚠️ Since item 4 this
+    /// is the **last resort**, not the answer: the project's own value arrives
+    /// on the fetch response and outranks it. It still earns its place, because
+    /// it is the only value available on a cold start with ENGRAM unreachable.
     pub require_assigned_skill: bool,
 }
 
@@ -1195,8 +1196,107 @@ pub enum StartupOutcome {
 pub async fn fetch_with_policy<F, Fut>(
     cfg: &SkillFetchConfig,
     requirements: &mut RequirementCache,
-    mut fetch: F,
+    fetch: F,
 ) -> StartupOutcome
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Fetched>,
+{
+    let (fetched, attempts) = fetch_until_settled(fetch).await;
+
+    // Item 4: the requirement is the project's, not the environment's --
+    // `cfg.require_assigned_skill` is now only the last resort.
+    if requirement_field_missing(&fetched.outcome, fetched.require_assigned_skill) {
+        tracing::warn!(
+            project = %cfg.project,
+            outcome = ?fetched.outcome,
+            "engram skill fetch: response carried no `require_assigned_skill`, which seam \
+             v1.16 §7.1 says this status carries; falling back to the cache, then to \
+             ENGRAM_REQUIRE_ASSIGNED_SKILL"
+        );
+    }
+    let require_assigned_skill = requirements.resolve(
+        &cfg.project,
+        fetched.require_assigned_skill,
+        cfg.require_assigned_skill,
+    );
+
+    match decide(&fetched.outcome, require_assigned_skill, attempts) {
+        HarnessAction::InstallSkill => {
+            let Some(skill) = fetched.skill_md else {
+                // `Assigned` without a payload is refused by
+                // `interpret_payload`, so this is unreachable through the
+                // real client. Degrade rather than unwrap: a panic here
+                // takes down an agent at startup.
+                return StartupOutcome::Degraded {
+                    reason: "ENGRAM reported a skill but sent no files".to_string(),
+                };
+            };
+            match skill.write_into(&cfg.skills_root) {
+                // Built only after the write succeeded: an instruction to
+                // load a skill that is not on disk sends the agent to a
+                // tool call that fails.
+                Ok(path) => {
+                    let installed = InstalledSkill {
+                        directory: skill.directory.clone(),
+                        references: skill.reference_paths(),
+                    };
+                    // Item 6: the files are on disk either way. What the
+                    // gap decides is whether this agent may work.
+                    match gap_trouble(&fetched.unreadable_parts, require_assigned_skill) {
+                        None => StartupOutcome::Installed {
+                            path,
+                            skill: installed,
+                        },
+                        Some(trouble) => StartupOutcome::InstalledWithGaps {
+                            path,
+                            skill: installed,
+                            trouble,
+                        },
+                    }
+                }
+                // A write failure is NOT retried: the payload was fine and
+                // the filesystem is not going to change its mind within
+                // the ladder. The reason names the offending path.
+                Err(e) => StartupOutcome::Degraded {
+                    reason: e.to_string(),
+                },
+            }
+        }
+        HarnessAction::StartNormally => StartupOutcome::StartedNormally,
+        // Unreachable: `fetch_until_settled` returns only once `decide`
+        // has stopped asking for a retry. Degrading rather than looping or
+        // panicking, because an unreachable branch that spins is worse
+        // than one that reports.
+        HarnessAction::Retry { attempt, .. } => {
+            tracing::error!(
+                attempt,
+                "engram skill fetch: the ladder returned a retry it had already run; \
+                     treating it as a failure rather than looping"
+            );
+            StartupOutcome::Degraded {
+                reason: "the fetch ladder did not settle".to_string(),
+            }
+        }
+        HarnessAction::DegradedMode { reason } => StartupOutcome::Degraded { reason },
+        HarnessAction::RefuseTasks { reason } => StartupOutcome::RefuseTasks { reason },
+    }
+}
+
+/// Run the backoff ladder and return the answer it settled on, with the number
+/// of retries it took.
+///
+/// ⚠️ **`decide` stays the single owner of "retry now".** This function asks it
+/// with `require_assigned_skill: false` on purpose: the ladder decides nothing
+/// about policy, and passing the real value would let it terminate in
+/// `RefuseTasks` — a policy decision made twice, in two places, from two
+/// different values. The caller applies the real requirement to the settled
+/// answer.
+///
+/// Extracted when the doorbell refetch (B3) needed the same ladder with a
+/// **different** policy on the other end: a successful `no_skill_assigned` must
+/// delete the directory there and must not at startup.
+async fn fetch_until_settled<F, Fut>(mut fetch: F) -> (Fetched, u32)
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Fetched>,
@@ -1204,73 +1304,12 @@ where
     let mut attempts = 0;
     loop {
         let fetched = fetch().await;
-
-        // Item 4: the requirement is the project's, not the environment's --
-        // `cfg.require_assigned_skill` is now only the last resort.
-        if requirement_field_missing(&fetched.outcome, fetched.require_assigned_skill) {
-            tracing::warn!(
-                project = %cfg.project,
-                outcome = ?fetched.outcome,
-                "engram skill fetch: response carried no `require_assigned_skill`, which seam \
-                 v1.16 §7.1 says this status carries; falling back to the cache, then to \
-                 ENGRAM_REQUIRE_ASSIGNED_SKILL"
-            );
-        }
-        let require_assigned_skill = requirements.resolve(
-            &cfg.project,
-            fetched.require_assigned_skill,
-            cfg.require_assigned_skill,
-        );
-
-        match decide(&fetched.outcome, require_assigned_skill, attempts) {
-            HarnessAction::InstallSkill => {
-                let Some(skill) = fetched.skill_md else {
-                    // `Assigned` without a payload is refused by
-                    // `interpret_payload`, so this is unreachable through the
-                    // real client. Degrade rather than unwrap: a panic here
-                    // takes down an agent at startup.
-                    return StartupOutcome::Degraded {
-                        reason: "ENGRAM reported a skill but sent no files".to_string(),
-                    };
-                };
-                return match skill.write_into(&cfg.skills_root) {
-                    // Built only after the write succeeded: an instruction to
-                    // load a skill that is not on disk sends the agent to a
-                    // tool call that fails.
-                    Ok(path) => {
-                        let installed = InstalledSkill {
-                            directory: skill.directory.clone(),
-                            references: skill.reference_paths(),
-                        };
-                        // Item 6: the files are on disk either way. What the
-                        // gap decides is whether this agent may work.
-                        match gap_trouble(&fetched.unreadable_parts, require_assigned_skill) {
-                            None => StartupOutcome::Installed {
-                                path,
-                                skill: installed,
-                            },
-                            Some(trouble) => StartupOutcome::InstalledWithGaps {
-                                path,
-                                skill: installed,
-                                trouble,
-                            },
-                        }
-                    }
-                    // A write failure is NOT retried: the payload was fine and
-                    // the filesystem is not going to change its mind within
-                    // the ladder. The reason names the offending path.
-                    Err(e) => StartupOutcome::Degraded {
-                        reason: e.to_string(),
-                    },
-                };
-            }
-            HarnessAction::StartNormally => return StartupOutcome::StartedNormally,
+        match decide(&fetched.outcome, false, attempts) {
             HarnessAction::Retry { delay_secs, .. } => {
                 attempts += 1;
                 tokio::time::sleep(Duration::from_secs(delay_secs)).await;
             }
-            HarnessAction::DegradedMode { reason } => return StartupOutcome::Degraded { reason },
-            HarnessAction::RefuseTasks { reason } => return StartupOutcome::RefuseTasks { reason },
+            _ => return (fetched, attempts),
         }
     }
 }
@@ -1340,6 +1379,495 @@ fn apply_outcome(outcome: &StartupOutcome, retry: bool) {
             tracing::error!(reason = %reason, "engram skill fetch: refusing tasks")
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// B3 / D19 item 2a: recognising a skill doorbell.
+//
+// By the time a doorbell is a kind-9 in a channel, the seam's `kind` has been
+// collapsed into prose -- `skill.assigned` exists in ENGRAM's envelope and
+// nowhere in the message. So recognition is by what the adapter POSTS, and the
+// design (`BUZZ_PROPOSAL_SEAM_V1_14_SKILL_DOORBELLS.md` §6) settled on two
+// conditions out of three:
+//
+//   1. the `action` JSON names `get_assigned_skill` -- a structured object
+//      ENGRAM guarantees, not a sentence either side may reword;
+//   2. the author is the seam adapter's own key.
+//
+// The third, a `["seam","skill.revised"]` tag on the kind-9, is NOT used: three
+// of its four legs are measured and the fourth is not -- whether the relay
+// accepts a kind-9 carrying a tag it does not know. It can be added as a third
+// condition if that is ever proven.
+//
+// ⚠️ **Condition 2 is a security boundary, not a tidiness check.** This path
+// makes an MCP call and writes -- sometimes DELETES -- a directory, driven by a
+// channel message. Every allowlisted peer can post in these rooms, so without
+// the author pin any of them could trigger a skill rewrite by posting one JSON
+// line. With `ENGRAM_SEAM_PUBKEY` unset the dispatch is OFF, which is the
+// pre-B3 behaviour: the doorbell costs one turn and achieves nothing.
+//
+// ⚠️ **And a third condition the design did not state, found while writing it:
+// the doorbell must mention US.** The adapter addresses exactly one agent per
+// doorbell, and two of our agents share rooms. Dispatching on any skill
+// doorbell in the room would make the researcher rewrite its skill because the
+// coder was rung -- the fetch would return the researcher's own truth, so the
+// result would look right and the TRIGGER would be someone else's. The `p` tag
+// is how ENGRAM said which agent it rang.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The tool a skill doorbell's `action` names.
+const SKILL_DOORBELL_TOOL: &str = "get_assigned_skill";
+
+/// What a recognised skill doorbell carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillDoorbell {
+    /// `action.args.project`, when the doorbell names one.
+    pub project: Option<String>,
+}
+
+/// Is this event a skill doorbell this agent should act on?
+///
+/// All three conditions, in the order that makes a rejection cheapest to read:
+/// the dispatch is configured, the author is the adapter, and the body names
+/// the tool. The mention check is the caller's, because only it knows this
+/// agent's own pubkey and already has a tested helper for the `p` tags.
+pub fn skill_doorbell_from_adapter(
+    seam_pubkey: &str,
+    author_hex: &str,
+    body: &str,
+) -> Option<SkillDoorbell> {
+    if !author_hex.eq_ignore_ascii_case(seam_pubkey) {
+        return None;
+    }
+    read_skill_doorbell(body)
+}
+
+/// The seam adapter's Nostr pubkey, lowercase hex, from `ENGRAM_SEAM_PUBKEY`.
+///
+/// ⚠️ Read once by the inbound loop rather than per event, and kept OUT of
+/// `SkillFetchConfig` on purpose: recognising a doorbell needs this key and
+/// nothing else, while the fetch config carries a PAT. Two values with two
+/// lifetimes and two audiences, so two readers.
+///
+/// `None` means the B3 dispatch is **off** — which is every agent before
+/// v1.3.0, and a valid configuration rather than an error.
+pub fn seam_pubkey_from_env() -> Option<String> {
+    std::env::var("ENGRAM_SEAM_PUBKEY")
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty())
+}
+
+/// Read a skill doorbell out of a channel message body.
+///
+/// The body is up to four lines (`doorbell_text`): a label, maybe a url, maybe
+/// a `subject` JSON line, then the `action` JSON line. Every line is tried
+/// rather than only the last, because `subject`'s presence moves `action`'s
+/// position and a parser that counted lines would break the first time ENGRAM
+/// added a field.
+pub fn read_skill_doorbell(body: &str) -> Option<SkillDoorbell> {
+    for line in body.lines() {
+        let line = line.trim();
+        if !line.starts_with('{') {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let names_the_tool = value
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .is_some_and(|tools| {
+                tools
+                    .iter()
+                    .any(|t| t.as_str() == Some(SKILL_DOORBELL_TOOL))
+            });
+        if !names_the_tool {
+            continue;
+        }
+        return Some(SkillDoorbell {
+            project: value
+                .get("args")
+                .and_then(|a| a.get("project"))
+                .and_then(|p| p.as_str())
+                .map(str::to_string),
+        });
+    }
+    None
+}
+
+/// Whether a doorbell for `project` should make THIS agent refetch.
+///
+/// ⚠️ A doorbell naming another project is **not** acted on. One process serves
+/// one `ENGRAM_PROJECT`, so a mismatch means routing delivered a signal to the
+/// wrong agent — and refetching anyway would rewrite a skill on the strength of
+/// a signal that was not about it. A doorbell with no project is accepted: the
+/// field is optional and the agent has only one project to refetch.
+pub fn doorbell_is_for_project(doorbell: &SkillDoorbell, configured: &str) -> bool {
+    match doorbell.project.as_deref() {
+        None => true,
+        Some(named) => named == configured,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// B3 / D19 item 2: the doorbell refetch.
+//
+// A `skill.assigned` or `skill.revised` doorbell says one thing: *your skill
+// directory is stale*. The refetch is the same call the startup path makes --
+// and the policy on the other end of it is NOT the same, which is the whole
+// reason this exists separately.
+//
+// ⚠️⚠️ **The difference that matters is `no_skill_assigned`.** At startup there
+// is no directory, so "nothing assigned" means start normally. On a refetch
+// there IS a directory, and "nothing assigned" is a SUCCESSFUL fetch telling us
+// the agent's skill was revoked. Carrying on would leave a revoked skill
+// running in Buzz indefinitely with every surface on both sides reporting
+// success -- and an unassign rings `skill.assigned` precisely because the
+// action is the same refetch (ENGRAM's Q1, agreed 2026-10-30). This gap was
+// found in our own delivery design by ENGRAM's question, and it is recorded in
+// `BUZZ_REPLY_TO_SEAM_V1_14_PROPOSAL.md` §2.1 as a table. That table is this
+// enum.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// What a doorbell-driven refetch must do to the directory already on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefetchAction {
+    /// `assigned`: atomic swap to the new composition. The normal path.
+    Swap,
+    /// `no_skill_assigned`: **remove it.** A successful fetch saying the agent
+    /// has no skill, which is what an unassign looks like.
+    Remove,
+    /// `skills_disabled`: leave it, and log. The flag says nothing about the
+    /// assignment, and treating a feature-flag state as a revocation would
+    /// strip every agent on a flag flip.
+    Leave,
+    /// A fetch error: **keep the last good directory.** D20's degraded mode is
+    /// for an agent that never got its skill; one ENGRAM outage must not strip
+    /// a working agent of a skill it already holds.
+    KeepLastGood { reason: String },
+}
+
+/// The four-outcome table, as a function.
+pub fn decide_refetch(outcome: &FetchOutcome) -> RefetchAction {
+    match outcome {
+        FetchOutcome::Assigned => RefetchAction::Swap,
+        FetchOutcome::NoSkillAssigned => RefetchAction::Remove,
+        FetchOutcome::SkillsDisabled => RefetchAction::Leave,
+        FetchOutcome::Failed(reason) => RefetchAction::KeepLastGood {
+            reason: reason.clone(),
+        },
+    }
+}
+
+/// What a refetch did, for the log line and the receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefetchOutcome {
+    /// A new composition is on disk.
+    Swapped {
+        path: PathBuf,
+        skill: InstalledSkill,
+    },
+    /// Installed, and ENGRAM named parts it could not read (item 6).
+    SwappedWithGaps {
+        path: PathBuf,
+        skill: InstalledSkill,
+        trouble: SkillTrouble,
+    },
+    /// The assignment is gone and so is the directory.
+    Removed { path: PathBuf },
+    /// The assignment is gone, there was nothing on disk to remove.
+    NothingToRemove,
+    /// Skills are off; the directory was left alone.
+    LeftAlone,
+    /// The fetch failed; the previous skill is still in place.
+    KeptLastGood { reason: String },
+    /// The switch is off, or the config is unusable. Nothing happened.
+    NotConfigured,
+}
+
+/// Remove an installed skill directory, with the same path discipline the
+/// writer uses.
+///
+/// ⚠️ This is the only **destructive** filesystem operation in this module, and
+/// it is driven by a name that arrives over the network, so the name is checked
+/// rather than trusted: one path segment, no separators, no traversal. It also
+/// refuses anything that is not a directory, so a symlink planted at that path
+/// is not followed and a stray file is not silently eaten. `remove_dir_all` on
+/// a symlink removes the link rather than its target, but asserting the type
+/// first means we never have to rely on that.
+fn remove_skill_dir(
+    skills_root: &Path,
+    directory: &str,
+) -> Result<Option<PathBuf>, SkillWriteError> {
+    check_segment(directory).map_err(|why| SkillWriteError::BadDirectory {
+        directory: directory.to_string(),
+        why,
+    })?;
+    let target = skills_root.join(directory);
+    let meta = match fs::symlink_metadata(&target) {
+        Ok(m) => m,
+        // Already gone. Idempotent on purpose: a replayed doorbell must not
+        // turn into an error, and `at-least-once` makes replays expected.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(io_err("reading the skill directory", &target, e)),
+    };
+    if !meta.is_dir() {
+        return Err(SkillWriteError::BadPath {
+            path: target.display().to_string(),
+            why: "it is not a directory, so it is not a skill this harness wrote",
+        });
+    }
+    fs::remove_dir_all(&target).map_err(|e| io_err("removing the skill directory", &target, e))?;
+    Ok(Some(target))
+}
+
+/// One doorbell refetch: fetch, then apply the four-outcome table.
+///
+/// Generic over the fetch, like `fetch_with_policy`, so every branch is tested
+/// without a network.
+pub async fn refetch_with_policy<F, Fut>(
+    cfg: &SkillFetchConfig,
+    requirements: &mut RequirementCache,
+    fetch: F,
+) -> RefetchOutcome
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Fetched>,
+{
+    let (fetched, _attempts) = fetch_until_settled(fetch).await;
+
+    if requirement_field_missing(&fetched.outcome, fetched.require_assigned_skill) {
+        tracing::warn!(
+            project = %cfg.project,
+            outcome = ?fetched.outcome,
+            "engram skill refetch: response carried no `require_assigned_skill`"
+        );
+    }
+    let require_assigned_skill = requirements.resolve(
+        &cfg.project,
+        fetched.require_assigned_skill,
+        cfg.require_assigned_skill,
+    );
+
+    match decide_refetch(&fetched.outcome) {
+        RefetchAction::Swap => {
+            let Some(skill) = fetched.skill_md else {
+                // Refused by `interpret_payload`, so unreachable through the
+                // real client. Keep what is on disk rather than act on nothing.
+                return RefetchOutcome::KeptLastGood {
+                    reason: "ENGRAM reported a skill but sent no files".to_string(),
+                };
+            };
+            match skill.write_into(&cfg.skills_root) {
+                Ok(path) => {
+                    let installed = InstalledSkill {
+                        directory: skill.directory.clone(),
+                        references: skill.reference_paths(),
+                    };
+                    record_installed(installed.clone());
+                    match gap_trouble(&fetched.unreadable_parts, require_assigned_skill) {
+                        None => {
+                            clear_trouble();
+                            RefetchOutcome::Swapped {
+                                path,
+                                skill: installed,
+                            }
+                        }
+                        Some(trouble) => {
+                            record_trouble(trouble.clone());
+                            RefetchOutcome::SwappedWithGaps {
+                                path,
+                                skill: installed,
+                                trouble,
+                            }
+                        }
+                    }
+                }
+                // The write failed, so what is on disk is the previous skill
+                // and the agent is working from it. Degraded, never refusing:
+                // see `KeepLastGood`.
+                Err(e) => {
+                    record_trouble(SkillTrouble::Degraded {
+                        reason: e.to_string(),
+                    });
+                    RefetchOutcome::KeptLastGood {
+                        reason: e.to_string(),
+                    }
+                }
+            }
+        }
+
+        RefetchAction::Remove => {
+            let installed = installed_skill();
+            let removed = match &installed {
+                Some(skill) => match remove_skill_dir(&cfg.skills_root, &skill.directory) {
+                    Ok(path) => path,
+                    Err(e) => {
+                        // The directory is still there and the agent is still
+                        // using a skill ENGRAM says it should not have. That is
+                        // worth an alert, not silence.
+                        tracing::error!(
+                            error = %e,
+                            "engram skill refetch: the assignment is gone but the directory \
+                             could not be removed; the agent is running a revoked skill"
+                        );
+                        record_trouble(SkillTrouble::Degraded {
+                            reason: format!("could not remove a revoked skill: {e}"),
+                        });
+                        return RefetchOutcome::KeptLastGood {
+                            reason: e.to_string(),
+                        };
+                    }
+                },
+                None => None,
+            };
+            // ⚠️ Clear the bootstrap record whether or not a directory was
+            // there. It names a skill the agent no longer has, and an
+            // instruction to load a skill that is not on disk sends the model
+            // to a tool call that fails — acceptance check 8.
+            clear_installed();
+            // The agent now has no skill. Whether it may still work is item
+            // 4/5's question, answered with the project's own setting.
+            if require_assigned_skill {
+                record_trouble(SkillTrouble::Refusing {
+                    reason: "the assigned skill was removed and this project requires one".into(),
+                });
+            } else {
+                clear_trouble();
+            }
+            match removed {
+                Some(path) => RefetchOutcome::Removed { path },
+                None => RefetchOutcome::NothingToRemove,
+            }
+        }
+
+        RefetchAction::Leave => {
+            // `skills_disabled` outranks the requirement, cached or local
+            // (§7.1), so this clears rather than evaluates.
+            clear_trouble();
+            RefetchOutcome::LeftAlone
+        }
+
+        RefetchAction::KeepLastGood { reason } => {
+            // ⚠️ Degraded, NOT refusing, and deliberately NOT what `decide`
+            // would say for the same outcome. `decide` is written for startup,
+            // where a failed fetch under the requirement means the agent never
+            // got a skill. Here it HAS one and merely could not refresh it, so
+            // refusing would take a working agent down for an ENGRAM outage.
+            record_trouble(SkillTrouble::Degraded {
+                reason: reason.clone(),
+            });
+            RefetchOutcome::KeptLastGood { reason }
+        }
+    }
+}
+
+/// The receipt for one refetch: a reaction, never a reply.
+///
+/// A reaction is a signed event in the audit log, so "the doorbell was
+/// installed" becomes measurable from the relay without a sentence in the room
+/// or a model turn spent. `None` is silence, and `skills_disabled` gets it
+/// because the contract's instruction for a deliberately disabled feature is to
+/// announce nothing.
+pub fn doorbell_receipt(outcome: &RefetchOutcome) -> Option<&'static str> {
+    match outcome {
+        RefetchOutcome::Swapped { .. } | RefetchOutcome::SwappedWithGaps { .. } => Some("📘"),
+        RefetchOutcome::Removed { .. } | RefetchOutcome::NothingToRemove => Some("🗑️"),
+        // The doorbell asked for a refresh and did not get one. The room's
+        // receipt says so, and the announcement says why.
+        RefetchOutcome::KeptLastGood { .. } => Some("⚠️"),
+        RefetchOutcome::LeftAlone | RefetchOutcome::NotConfigured => None,
+    }
+}
+
+/// Serialises doorbell refetches.
+///
+/// ⚠️ **Deliberately a lock and not a debounce.** The design's B3 row called for
+/// coalescing two revisions in one editing session into one refetch, and that
+/// would mean DROPPING a doorbell. Our own reply to ENGRAM (§2.1) is the
+/// argument against it: an unassign's doorbell is the only one whose correct
+/// outcome is a **deletion**, so it is the only one where a dropped doorbell
+/// leaves the system in a state ENGRAM believes it has already left. Two
+/// sequential refetches are idempotent and end in the same place; a dropped one
+/// can leave a revoked skill running. So they queue.
+static REFETCH_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+fn refetch_lock() -> &'static tokio::sync::Mutex<()> {
+    REFETCH_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// Handle one skill doorbell: refetch, apply the four-outcome table, log.
+///
+/// Returns the outcome so the caller can post the receipt; the caller has the
+/// relay handle and the event id, and this does not.
+pub async fn handle_skill_doorbell(doorbell: &SkillDoorbell) -> RefetchOutcome {
+    let cfg = match SkillFetchConfig::from_env() {
+        Ok(Some(cfg)) => cfg,
+        Ok(None) => {
+            // The switch is off. A doorbell arriving anyway is worth one line:
+            // ENGRAM thinks this agent has a skill and the harness is not
+            // fetching one.
+            tracing::info!(
+                "engram skill doorbell: ENGRAM_SKILL_FETCH is off, so nothing was refetched"
+            );
+            return RefetchOutcome::NotConfigured;
+        }
+        Err(why) => {
+            tracing::error!("engram skill doorbell: the fetch is misconfigured: {why}");
+            return RefetchOutcome::NotConfigured;
+        }
+    };
+
+    if !doorbell_is_for_project(doorbell, &cfg.project) {
+        tracing::warn!(
+            doorbell_project = doorbell.project.as_deref().unwrap_or("-"),
+            configured_project = %cfg.project,
+            "engram skill doorbell: names another project, so it was not acted on"
+        );
+        return RefetchOutcome::NotConfigured;
+    }
+
+    let client = match cfg.client(FETCH_HTTP_TIMEOUT) {
+        Ok(c) => c,
+        Err(why) => {
+            tracing::error!("engram skill doorbell: {why}");
+            return RefetchOutcome::KeptLastGood { reason: why };
+        }
+    };
+
+    let _serialised = refetch_lock().lock().await;
+    let mut requirements = RequirementCache::new();
+    let outcome = refetch_with_policy(&cfg, &mut requirements, || client.fetch(&cfg.project)).await;
+
+    match &outcome {
+        RefetchOutcome::Swapped { path, skill } => tracing::info!(
+            path = %path.display(),
+            parts = skill.references.len(),
+            "engram skill doorbell: refetched and swapped"
+        ),
+        RefetchOutcome::SwappedWithGaps { path, trouble, .. } => tracing::error!(
+            path = %path.display(),
+            reason = %trouble.reason(),
+            "engram skill doorbell: refetched WITH GAPS"
+        ),
+        RefetchOutcome::Removed { path } => tracing::warn!(
+            path = %path.display(),
+            "engram skill doorbell: the assignment is gone, so the skill was removed"
+        ),
+        RefetchOutcome::NothingToRemove => tracing::info!(
+            "engram skill doorbell: the assignment is gone and nothing was installed"
+        ),
+        RefetchOutcome::LeftAlone => tracing::info!(
+            "engram skill doorbell: skills are disabled for this project; the directory was left"
+        ),
+        RefetchOutcome::KeptLastGood { reason } => tracing::error!(
+            reason = %reason,
+            "engram skill doorbell: the refetch failed; the previous skill is still in place"
+        ),
+        RefetchOutcome::NotConfigured => {}
+    }
+    outcome
 }
 
 /// The whole startup path: read the config, fetch, write, and log what happened.
@@ -1455,6 +1983,17 @@ pub fn record_installed(skill: InstalledSkill) {
 
 pub fn installed_skill() -> Option<InstalledSkill> {
     installed_slot().read().ok().and_then(|slot| slot.clone())
+}
+
+/// Forget the installed skill, because it is no longer on disk.
+///
+/// Only the unassign path calls this. The bootstrap is composed from this slot,
+/// so leaving it set after a removal would put "load your assigned skill" in a
+/// system prompt for a directory that is gone.
+pub fn clear_installed() {
+    if let Ok(mut slot) = installed_slot().write() {
+        *slot = None;
+    }
 }
 
 /// Whether a fetch is enabled and has not yet recorded a result.
@@ -1669,15 +2208,36 @@ pub fn trouble() -> Option<SkillTrouble> {
 /// module serialises that module and nothing else — which looks like
 /// serialisation and is not, and is the exact failure already recorded on
 /// `announcement_tests`.
+///
+/// ⚠️ A **tokio** mutex, not a `std` one, and the reason is clippy rather than
+/// taste: half the tests that need it are `#[tokio::test]`, and a `std` guard
+/// held across an `await` is `clippy::await_holding_lock` — refused by
+/// `-D warnings`. A tokio guard is designed to be held across one. There is no
+/// poisoning to recover from either, which is what the `std` version needed its
+/// `into_inner` for.
 #[cfg(test)]
-pub(crate) static STATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static STATE_TEST_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
 
-/// Takes the lock without caring whether a previous panic poisoned it: a
-/// failing test should report its own assertion, not drag the next one down
-/// with a poison error that hides it.
 #[cfg(test)]
-pub(crate) fn state_test_guard() -> std::sync::MutexGuard<'static, ()> {
-    STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+fn state_test_lock() -> &'static tokio::sync::Mutex<()> {
+    STATE_TEST_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// For a synchronous `#[test]`.
+///
+/// ⚠️ `blocking_lock` **panics** inside a runtime, so an async test must use
+/// `state_test_guard_async`. That is a feature here: the panic names the
+/// mistake immediately instead of letting an async test take a lock that
+/// blocks its own executor.
+#[cfg(test)]
+pub(crate) fn state_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    state_test_lock().blocking_lock()
+}
+
+/// For a `#[tokio::test]`.
+#[cfg(test)]
+pub(crate) async fn state_test_guard_async() -> tokio::sync::MutexGuard<'static, ()> {
+    state_test_lock().lock().await
 }
 
 /// Item 5's gate, read on the inbound path: `Some(reason)` means take no tasks.
@@ -2446,6 +3006,93 @@ mod fetch_tests {
         }
     }
 
+    // ── B3: recognising a skill doorbell ────────────────────────────────
+
+    const SEAM: &str = "5527a2f0a9bdc17a0000000000000000000000000000000000000000000000aa";
+    const PEER: &str = "b119dcc70000000000000000000000000000000000000000000000000000bbbb";
+
+    /// The shape the adapter actually posts, from `doorbell_text`: a label
+    /// line, a url line, then the `action` JSON.
+    fn doorbell_body(project: &str) -> String {
+        format!(
+            "@BE Coder Skill 'buzz-coder' was revised — your skill in Fernhill changed\n\
+             https://engram.pvelua.net/projects?project={project}\n\
+             {{\"args\":{{\"project\":\"{project}\"}},\"tools\":[\"get_assigned_skill\"]}}"
+        )
+    }
+
+    #[test]
+    fn the_action_line_is_what_identifies_a_skill_doorbell() {
+        let d = read_skill_doorbell(&doorbell_body("project:5c18cb29965881df")).unwrap();
+        assert_eq!(d.project.as_deref(), Some("project:5c18cb29965881df"));
+    }
+
+    #[test]
+    fn the_action_line_is_found_wherever_it_sits() {
+        // ⚠️ `subject` [v1.15] goes immediately BEFORE `action`, so the action
+        // is not always the last line and a parser that counted lines would
+        // break the first time ENGRAM added a field. Both orders here.
+        let with_subject = "A skill was assigned to you in Fernhill\n             https://engram.pvelua.net/projects\n             {\"skill\":\"skill_abc\"}\n             {\"tools\":[\"get_assigned_skill\"],\"args\":{\"project\":\"project:1\"}}";
+        assert_eq!(
+            read_skill_doorbell(with_subject)
+                .unwrap()
+                .project
+                .as_deref(),
+            Some("project:1")
+        );
+        let action_first = "{\"tools\":[\"get_assigned_skill\"]}\nsomething after";
+        assert!(read_skill_doorbell(action_first).is_some());
+    }
+
+    #[test]
+    fn a_doorbell_may_name_no_project() {
+        let d = read_skill_doorbell("label\n{\"tools\":[\"get_assigned_skill\"]}").unwrap();
+        assert_eq!(d.project, None);
+        // The field is optional and one process serves one project, so this is
+        // accepted rather than refused.
+        assert!(doorbell_is_for_project(&d, "project:anything"));
+    }
+
+    #[test]
+    fn another_projects_doorbell_is_not_acted_on() {
+        let d = read_skill_doorbell(&doorbell_body("project:other")).unwrap();
+        assert!(!doorbell_is_for_project(&d, "project:ours"));
+        assert!(doorbell_is_for_project(&d, "project:other"));
+    }
+
+    #[test]
+    fn a_doorbell_for_another_tool_is_not_a_skill_doorbell() {
+        // The approval doorbell, which this agent gets regularly and which must
+        // reach the model rather than the refetch.
+        let approval = "@Buzz Lead Your proposed addition was approved\n             https://engram.pvelua.net/projects\n             {\"args\":{\"project\":\"project:31eed396a8cdab2d\"},\"tools\":[\"list_project_artifacts\"]}";
+        assert_eq!(read_skill_doorbell(approval), None);
+    }
+
+    #[test]
+    fn prose_and_malformed_json_are_not_doorbells() {
+        for body in [
+            "please refetch your skill with get_assigned_skill",
+            "{\"tools\":[\"get_assigned_skill\"",
+            "{\"tools\":\"get_assigned_skill\"}",
+            "{\"tools\":[]}",
+            "",
+        ] {
+            assert_eq!(read_skill_doorbell(body), None, "{body:?}");
+        }
+    }
+
+    #[test]
+    fn only_the_adapters_own_key_can_ring_the_doorbell() {
+        let body = doorbell_body("project:1");
+        assert!(skill_doorbell_from_adapter(SEAM, SEAM, &body).is_some());
+        // ⚠️ The security half. Every allowlisted peer can post in these rooms,
+        // and this path makes an MCP call and rewrites -- sometimes deletes --
+        // a directory. A peer posting the same JSON must achieve nothing.
+        assert_eq!(skill_doorbell_from_adapter(SEAM, PEER, &body), None);
+        // Case is not a discriminator: hex is hex.
+        assert!(skill_doorbell_from_adapter(SEAM, &SEAM.to_uppercase(), &body).is_some());
+    }
+
     // ── Item 6: `unreadable_parts` on the wire (seam v1.16 §7.1) ────────
 
     fn assigned_with(extra: serde_json::Value) -> Fetched {
@@ -3047,6 +3694,290 @@ mod policy_tests {
         assert_eq!(script.calls(), 1, "a write failure must not retry");
     }
 
+    // ── B3: the refetch's four outcomes ─────────────────────────────────
+
+    #[test]
+    fn the_four_outcome_table_is_what_it_says() {
+        assert_eq!(decide_refetch(&FetchOutcome::Assigned), RefetchAction::Swap);
+        // ⚠️ The one that differs from startup, and the reason this table
+        // exists: a successful fetch saying "nothing assigned" IS an unassign.
+        assert_eq!(
+            decide_refetch(&FetchOutcome::NoSkillAssigned),
+            RefetchAction::Remove
+        );
+        assert_eq!(
+            decide_refetch(&FetchOutcome::SkillsDisabled),
+            RefetchAction::Leave
+        );
+        assert_eq!(
+            decide_refetch(&FetchOutcome::Failed("timed out".into())),
+            RefetchAction::KeepLastGood {
+                reason: "timed out".into()
+            }
+        );
+    }
+
+    #[test]
+    fn the_startup_and_refetch_policies_disagree_on_nothing_assigned() {
+        // Stated as a test because it is the single most dangerous place for
+        // the two to be "tidied" into one function later.
+        assert_eq!(
+            decide(&FetchOutcome::NoSkillAssigned, false, 0),
+            HarnessAction::StartNormally
+        );
+        assert_eq!(
+            decide_refetch(&FetchOutcome::NoSkillAssigned),
+            RefetchAction::Remove
+        );
+    }
+
+    #[test]
+    fn the_receipt_is_a_reaction_and_says_which_thing_happened() {
+        let skill = InstalledSkill {
+            directory: "buzz-coder".into(),
+            references: vec![],
+        };
+        assert_eq!(
+            doorbell_receipt(&RefetchOutcome::Swapped {
+                path: PathBuf::from("/x"),
+                skill: skill.clone()
+            }),
+            Some("📘")
+        );
+        assert_eq!(
+            doorbell_receipt(&RefetchOutcome::Removed {
+                path: PathBuf::from("/x")
+            }),
+            Some("🗑️")
+        );
+        assert_eq!(
+            doorbell_receipt(&RefetchOutcome::KeptLastGood { reason: "x".into() }),
+            Some("⚠️")
+        );
+        // `skills_disabled`: the contract says announce nothing, and a reaction
+        // is an announcement in the audit log.
+        assert_eq!(doorbell_receipt(&RefetchOutcome::LeftAlone), None);
+        assert_eq!(doorbell_receipt(&RefetchOutcome::NotConfigured), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_revision_swaps_the_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(root.path(), false);
+        let script = Script::new(vec![assigned()]);
+        match refetch_with_policy(&cfg, &mut RequirementCache::new(), || async {
+            script.next()
+        })
+        .await
+        {
+            RefetchOutcome::Swapped { path, skill } => {
+                assert_eq!(path, root.path().join("buzz-coder"));
+                assert_eq!(skill.references.len(), 7);
+            }
+            other => panic!("expected Swapped, got {other:?}"),
+        }
+        assert!(root.path().join("buzz-coder/SKILL.md").is_file());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unassign_removes_the_directory_and_forgets_the_bootstrap() {
+        // ⚠️ The test for the gap ENGRAM's question found in our design. If
+        // this one goes green while the directory survives, a skill revoked in
+        // ENGRAM keeps running in Buzz with both sides reporting success.
+        let _serialised = state_test_guard_async().await;
+        let root = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(root.path(), false);
+
+        // Install first, so there is something to revoke.
+        let install = Script::new(vec![assigned()]);
+        let _ = refetch_with_policy(&cfg, &mut RequirementCache::new(), || async {
+            install.next()
+        })
+        .await;
+        assert!(root.path().join("buzz-coder/SKILL.md").is_file());
+        assert!(installed_skill().is_some());
+
+        let unassign = Script::new(vec![Fetched::result(
+            FetchOutcome::NoSkillAssigned,
+            Some(false),
+        )]);
+        match refetch_with_policy(&cfg, &mut RequirementCache::new(), || async {
+            unassign.next()
+        })
+        .await
+        {
+            RefetchOutcome::Removed { path } => {
+                assert_eq!(path, root.path().join("buzz-coder"))
+            }
+            other => panic!("expected Removed, got {other:?}"),
+        }
+        assert!(
+            !root.path().join("buzz-coder").exists(),
+            "the revoked skill must be off the disk"
+        );
+        assert_eq!(
+            installed_skill(),
+            None,
+            "and the bootstrap must stop naming it -- acceptance check 8"
+        );
+        // The skills root itself is never touched.
+        assert!(root.path().is_dir());
+        clear_installed();
+        clear_trouble();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unassign_under_the_requirement_also_stops_the_agent_working() {
+        let _serialised = state_test_guard_async().await;
+        let root = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(root.path(), true);
+        clear_installed();
+        clear_trouble();
+        let script = Script::new(vec![Fetched::result(
+            FetchOutcome::NoSkillAssigned,
+            Some(true),
+        )]);
+        let out = refetch_with_policy(&cfg, &mut RequirementCache::new(), || async {
+            script.next()
+        })
+        .await;
+        assert_eq!(
+            out,
+            RefetchOutcome::NothingToRemove,
+            "nothing was installed"
+        );
+        assert!(
+            refusing_reason().is_some(),
+            "items 4/5 compose with B3: no skill, and the project requires one"
+        );
+        clear_trouble();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unassign_with_nothing_installed_is_not_an_error() {
+        let _serialised = state_test_guard_async().await;
+        let root = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(root.path(), false);
+        clear_installed();
+        clear_trouble();
+        let script = Script::new(vec![Fetched::plain(FetchOutcome::NoSkillAssigned)]);
+        assert_eq!(
+            refetch_with_policy(&cfg, &mut RequirementCache::new(), || async {
+                script.next()
+            })
+            .await,
+            RefetchOutcome::NothingToRemove,
+            "at-least-once makes a replayed unassign expected, not exceptional"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn skills_disabled_leaves_the_directory_alone() {
+        // ⚠️ Treating a feature-flag state as a revocation would strip every
+        // agent on a flag flip.
+        let _serialised = state_test_guard_async().await;
+        let root = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(root.path(), false);
+        let install = Script::new(vec![assigned()]);
+        let _ = refetch_with_policy(&cfg, &mut RequirementCache::new(), || async {
+            install.next()
+        })
+        .await;
+
+        let disabled = Script::new(vec![Fetched::plain(FetchOutcome::SkillsDisabled)]);
+        assert_eq!(
+            refetch_with_policy(&cfg, &mut RequirementCache::new(), || async {
+                disabled.next()
+            })
+            .await,
+            RefetchOutcome::LeftAlone
+        );
+        assert!(
+            root.path().join("buzz-coder/SKILL.md").is_file(),
+            "the flag says nothing about the assignment"
+        );
+        assert!(installed_skill().is_some());
+        clear_installed();
+        clear_trouble();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_refetch_keeps_the_last_good_skill_and_degrades_rather_than_refusing() {
+        // ⚠️ Deliberately NOT what `decide` would say for the same outcome
+        // under the same requirement. `decide` is startup's policy, where a
+        // failed fetch means the agent never got a skill; here it HAS one and
+        // merely could not refresh it, so refusing would take a working agent
+        // down for an ENGRAM outage.
+        let _serialised = state_test_guard_async().await;
+        let root = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(root.path(), true);
+        let install = Script::new(vec![assigned()]);
+        let _ = refetch_with_policy(&cfg, &mut RequirementCache::new(), || async {
+            install.next()
+        })
+        .await;
+
+        let outage = Script::new(vec![]);
+        match refetch_with_policy(&cfg, &mut RequirementCache::new(), || async {
+            outage.next()
+        })
+        .await
+        {
+            RefetchOutcome::KeptLastGood { .. } => {}
+            other => panic!("expected KeptLastGood, got {other:?}"),
+        }
+        assert!(
+            root.path().join("buzz-coder/SKILL.md").is_file(),
+            "one outage must not strip a skill the agent already holds"
+        );
+        assert_eq!(
+            refusing_reason(),
+            None,
+            "it keeps working, degraded -- and this is the assertion that would \
+             catch someone unifying the two policies"
+        );
+        assert!(matches!(trouble(), Some(SkillTrouble::Degraded { .. })));
+        assert_eq!(
+            outage.calls(),
+            1 + FETCH_MAX_ATTEMPTS as usize,
+            "the ladder still runs"
+        );
+        clear_installed();
+        clear_trouble();
+    }
+
+    #[test]
+    fn removing_a_skill_refuses_a_name_that_is_not_one_segment() {
+        let root = tempfile::tempdir().unwrap();
+        // The name arrives over the network, so it is checked, not trusted.
+        for bad in ["..", ".", "", "a/b", "x\0y", " padded "] {
+            assert!(
+                remove_skill_dir(root.path(), bad).is_err(),
+                "must refuse {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn removing_a_skill_refuses_anything_that_is_not_a_directory() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("not-a-skill"), b"hello").unwrap();
+        assert!(remove_skill_dir(root.path(), "not-a-skill").is_err());
+        assert!(
+            root.path().join("not-a-skill").is_file(),
+            "and it must still be there -- a stray file is not ours to eat"
+        );
+    }
+
+    #[test]
+    fn removing_a_skill_that_is_already_gone_is_not_an_error() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(
+            remove_skill_dir(root.path(), "never-installed").unwrap(),
+            None
+        );
+    }
+
     // ── Item 6: what a gap means (seam v1.16 §7.1) ──────────────────────
 
     fn gap(position: u32, reason: &str) -> UnreadablePart {
@@ -3472,7 +4403,7 @@ mod announcement_tests {
     /// The lock itself is `super::STATE_TEST_LOCK`, shared with `lib.rs`'s
     /// gate test — a second lock here would serialise this module against
     /// itself and nothing else.
-    fn state_guard() -> std::sync::MutexGuard<'static, ()> {
+    fn state_guard() -> tokio::sync::MutexGuard<'static, ()> {
         state_test_guard()
     }
 
