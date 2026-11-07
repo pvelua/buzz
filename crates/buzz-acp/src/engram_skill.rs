@@ -407,10 +407,28 @@ pub enum HarnessAction {
 ///
 /// ⚠️ This is the number of **retries**, not of calls. `decide` retries while
 /// `attempts < FETCH_MAX_ATTEMPTS`, so a fetch that never succeeds makes
-/// `1 + FETCH_MAX_ATTEMPTS` = **4** calls and waits `1 + 4 + 10` = **15
-/// seconds** in total. The 15 seconds is the figure that matters: it is why
-/// this cannot live in the session-birth hook, whose budget is 3 seconds.
-/// `the_ladder_is_four_calls_and_fifteen_seconds` holds both numbers.
+/// `1 + FETCH_MAX_ATTEMPTS` = **4** calls and **sleeps** `1 + 4 + 10` = **15
+/// seconds**. That rules out the session-birth hook, whose budget is 3 seconds.
+///
+/// ⚠️⚠️ **The 15 seconds is the SLEEP budget, not the time to the alert, and
+/// the difference is a factor of six.** Each failed call also burns its own
+/// `FETCH_HTTP_TIMEOUT`, so against an **unreachable** host the ladder takes
+/// `4 × 20 + 15` = **95 seconds** before `DEGRADED` is logged. Measured on DEV
+/// 2026-11-07 with ENGRAM DEV down: `starting` 02:27:40.127, `DEGRADED`
+/// 02:29:15.163 — **95.04 s**, which is the arithmetic above and not a
+/// coincidence. A fast failure (a `401`, a coded error) returns immediately and
+/// the elapsed time really is ~15 s, which is why the shorter figure looked
+/// right for so long.
+///
+/// ⚠️ **Operationally this is the number that matters**, because it is how long
+/// a dead credential or a down ENGRAM looks like a healthy boot: the only line
+/// on stdout for the first 95 seconds is `engram skill fetch: starting`. Two
+/// separate reads concluded "no alert at all" from exactly that window — one at
+/// 2 s on PROD, one at 40 s on DEV — and both were wrong. **Read after 95 s or
+/// do not read.**
+///
+/// `the_ladder_is_four_calls_and_fifteen_seconds` holds the sleep budget;
+/// `an_unreachable_host_takes_ninety_five_seconds_to_alert` holds this one.
 pub const FETCH_MAX_ATTEMPTS: u32 = 3;
 
 fn backoff_secs(attempt: u32) -> u64 {
@@ -3604,7 +3622,44 @@ mod policy_tests {
             1 + FETCH_MAX_ATTEMPTS as usize,
             "the ladder is the initial call plus FETCH_MAX_ATTEMPTS retries"
         );
-        assert_eq!(waited, Duration::from_secs(15), "1 + 4 + 10");
+        assert_eq!(
+            waited,
+            Duration::from_secs(15),
+            "1 + 4 + 10 -- the SLEEP budget. This scripted fetch fails instantly, so elapsed \
+             == slept; a real unreachable host adds 4 x FETCH_HTTP_TIMEOUT on top. See \
+             `an_unreachable_host_takes_ninety_five_seconds_to_alert`"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unreachable_host_takes_ninety_five_seconds_to_alert() {
+        // ⚠️ The number the docs had wrong for two weeks, and the reason two
+        // separate log reads concluded "there is no alert at all": the ladder's
+        // 15 seconds is its SLEEP budget, and a call against an unreachable
+        // host also burns FETCH_HTTP_TIMEOUT before it fails. The test above
+        // measures 15 s only because its scripted fetch returns instantly.
+        //
+        // Measured on DEV 2026-11-07 with ENGRAM DEV down: `starting`
+        // 02:27:40.127 -> `DEGRADED` 02:29:15.163, 95.04 s. This reproduces
+        // that with the clock paused, by making each call take the timeout.
+        let root = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(root.path(), false);
+        let started = tokio::time::Instant::now();
+        let out = fetch_with_policy(&cfg, &mut RequirementCache::new(), || async {
+            tokio::time::sleep(FETCH_HTTP_TIMEOUT).await;
+            Fetched::failed("initialize failed: transport: error sending request")
+        })
+        .await;
+        let waited = started.elapsed();
+
+        assert!(matches!(out, StartupOutcome::Degraded { .. }), "{out:?}");
+        assert_eq!(
+            waited,
+            Duration::from_secs(95),
+            "4 calls x 20 s of HTTP timeout + 15 s of sleeps. If this figure ever changes, the \
+             operational instruction changes with it: an operator reading the log earlier than \
+             this sees only `starting` and will call a dead credential a healthy boot"
+        );
     }
 
     #[tokio::test(start_paused = true)]
