@@ -566,6 +566,82 @@ impl RequirementCache {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Item 6: a skill delivered with a named gap (seam v1.16 §7.1).
+//
+// `unreadable_parts` arrives on a status of `assigned`: the skill WAS
+// delivered, and ENGRAM is telling us which parts of it are missing. §7.1 and
+// Igor (2026-11-05) make the non-empty case D20's degraded mode **under the
+// requirement** -- announce, and refuse until a fetch delivers every part.
+//
+// ⚠️ `name_collisions` and `duplicate_parts` are informational and MUST NOT
+// change behaviour. They are logged and nothing else; a harness that refused
+// on a duplicate would take an agent down for a part ENGRAM already told us it
+// delivered once on purpose.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One part ENGRAM could not read, as §7.1 describes it.
+///
+/// ⚠️ Every field is optional, and that is not laziness. If a missing or
+/// renamed field made this fail to parse, a **named gap would become
+/// invisible** -- the one outcome worse than reporting it without detail.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct UnreadablePart {
+    #[serde(default)]
+    pub position: Option<u32>,
+    #[serde(default)]
+    pub skill_id: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+impl UnreadablePart {
+    /// How this part reads in a channel message. Compact, because the room
+    /// gets the whole list.
+    fn describe(&self) -> String {
+        let at = match self.position {
+            Some(p) => format!("position {p}"),
+            None => "unknown position".to_string(),
+        };
+        match (&self.skill_id, &self.reason) {
+            (Some(id), Some(why)) => format!("{at} ({id}: {why})"),
+            (Some(id), None) => format!("{at} ({id})"),
+            (None, Some(why)) => format!("{at} ({why})"),
+            (None, None) => at,
+        }
+    }
+}
+
+/// What a delivered-but-incomplete skill means for the agent.
+///
+/// `None` is the complete case. Under the requirement the gap refuses; without
+/// it the agent works on with a skill it knows is partial, and the room is told
+/// so -- a gap nobody is told about is a wrong answer with no explanation
+/// attached to it.
+pub fn gap_trouble(
+    unreadable: &[UnreadablePart],
+    require_assigned_skill: bool,
+) -> Option<SkillTrouble> {
+    if unreadable.is_empty() {
+        return None;
+    }
+    let detail = unreadable
+        .iter()
+        .map(UnreadablePart::describe)
+        .collect::<Vec<_>>()
+        .join("; ");
+    let reason = format!(
+        "ENGRAM delivered the skill with {} part{} it could not read — {detail}",
+        unreadable.len(),
+        if unreadable.len() == 1 { "" } else { "s" }
+    );
+    Some(if require_assigned_skill {
+        SkillTrouble::Refusing { reason }
+    } else {
+        SkillTrouble::Degraded { reason }
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Item 1: the fetch. `get_assigned_skill(project, format="skill_md")` over
 // streamable HTTP, reduced to a `FetchOutcome` plus the payload.
 //
@@ -593,6 +669,11 @@ pub struct Fetched {
     /// claim no response made -- and the precedence rule exists precisely to
     /// keep those two cases apart.
     pub require_assigned_skill: Option<bool>,
+    /// §7.1's `unreadable_parts` [item 6]. Non-empty only on `assigned`: the
+    /// skill arrived with a named gap. Empty everywhere else, which is the
+    /// same shape as "complete" on purpose — a failed fetch has no parts to
+    /// be missing.
+    pub unreadable_parts: Vec<UnreadablePart>,
 }
 
 impl Fetched {
@@ -601,6 +682,7 @@ impl Fetched {
             outcome: FetchOutcome::Failed(reason.into()),
             skill_md: None,
             require_assigned_skill: None,
+            unreadable_parts: Vec::new(),
         }
     }
 
@@ -609,6 +691,7 @@ impl Fetched {
             outcome,
             skill_md: None,
             require_assigned_skill: None,
+            unreadable_parts: Vec::new(),
         }
     }
 
@@ -618,6 +701,7 @@ impl Fetched {
             outcome,
             skill_md: None,
             require_assigned_skill,
+            unreadable_parts: Vec::new(),
         }
     }
 }
@@ -714,6 +798,28 @@ pub fn interpret_payload(text: &str) -> Fetched {
         },
     };
 
+    // §7.1: informational only, and logged here so that "it changed nothing"
+    // is a visible decision rather than an omission. A harness that refused on
+    // a duplicate would take an agent down for a part ENGRAM told us it
+    // delivered once deliberately.
+    for (field, what) in [
+        ("name_collisions", "two parts share a skill name"),
+        (
+            "duplicate_parts",
+            "a part was reached twice and delivered once",
+        ),
+    ] {
+        if let Some(n) = value.get(field).and_then(|v| v.as_array()).map(Vec::len) {
+            if n > 0 {
+                tracing::info!(
+                    field,
+                    count = n,
+                    "get_assigned_skill: {what}; informational, the skill is still installed"
+                );
+            }
+        }
+    }
+
     match status {
         "no_skill_assigned" => {
             Fetched::result(FetchOutcome::NoSkillAssigned, require_assigned_skill)
@@ -728,6 +834,7 @@ pub fn interpret_payload(text: &str) -> Fetched {
                     outcome: FetchOutcome::Assigned,
                     skill_md: Some(skill_md),
                     require_assigned_skill,
+                    unreadable_parts: read_unreadable_parts(&value),
                 },
                 Err(e) => Fetched::failed(format!("`skill_md` did not parse: {e}")),
             },
@@ -736,6 +843,36 @@ pub fn interpret_payload(text: &str) -> Fetched {
             None => Fetched::failed("status `assigned` carried no `skill_md`"),
         },
         other => Fetched::failed(format!("unknown status `{other}`")),
+    }
+}
+
+/// `unreadable_parts`, read so that nothing can make a named gap invisible.
+///
+/// ⚠️ A present-but-malformed value becomes **one gap with the malformation as
+/// its reason**, rather than no gaps. Reading it as "complete" would turn a
+/// contract breach into a silently partial skill, which is the failure this
+/// whole item exists to prevent.
+fn read_unreadable_parts(value: &serde_json::Value) -> Vec<UnreadablePart> {
+    let Some(raw) = value.get("unreadable_parts") else {
+        return Vec::new();
+    };
+    if raw.is_null() {
+        return Vec::new();
+    }
+    match serde_json::from_value::<Vec<UnreadablePart>>(raw.clone()) {
+        Ok(parts) => parts,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "get_assigned_skill: `unreadable_parts` did not parse; treating it as one \
+                 unreadable part rather than as none"
+            );
+            vec![UnreadablePart {
+                position: None,
+                skill_id: None,
+                reason: Some(format!("`unreadable_parts` did not parse: {e}")),
+            }]
+        }
     }
 }
 
@@ -1032,6 +1169,16 @@ pub enum StartupOutcome {
         path: PathBuf,
         skill: InstalledSkill,
     },
+    /// Written, and ENGRAM named parts of it that it could not read (item 6).
+    /// Carries the trouble rather than a bool, because the same delivery
+    /// refuses under the requirement and merely degrades without it — and the
+    /// skill is still installed either way, so the bootstrap can name what did
+    /// arrive.
+    InstalledWithGaps {
+        path: PathBuf,
+        skill: InstalledSkill,
+        trouble: SkillTrouble,
+    },
     /// Nothing to do, and nothing to say.
     StartedNormally,
     /// Up, but without the skill it was supposed to have. Announce and alert.
@@ -1090,13 +1237,25 @@ where
                     // Built only after the write succeeded: an instruction to
                     // load a skill that is not on disk sends the agent to a
                     // tool call that fails.
-                    Ok(path) => StartupOutcome::Installed {
-                        path,
-                        skill: InstalledSkill {
+                    Ok(path) => {
+                        let installed = InstalledSkill {
                             directory: skill.directory.clone(),
                             references: skill.reference_paths(),
-                        },
-                    },
+                        };
+                        // Item 6: the files are on disk either way. What the
+                        // gap decides is whether this agent may work.
+                        match gap_trouble(&fetched.unreadable_parts, require_assigned_skill) {
+                            None => StartupOutcome::Installed {
+                                path,
+                                skill: installed,
+                            },
+                            Some(trouble) => StartupOutcome::InstalledWithGaps {
+                                path,
+                                skill: installed,
+                                trouble,
+                            },
+                        }
+                    }
                     // A write failure is NOT retried: the payload was fine and
                     // the filesystem is not going to change its mind within
                     // the ladder. The reason names the offending path.
@@ -1140,6 +1299,24 @@ fn apply_outcome(outcome: &StartupOutcome, retry: bool) {
                 parts = skill.references.len(),
                 "engram skill fetch: {}",
                 if retry { "recovered and installed" } else { "installed" }
+            )
+        }
+        StartupOutcome::InstalledWithGaps {
+            path,
+            skill,
+            trouble,
+        } => {
+            // Recorded even while refusing: no turn runs, but a later fetch
+            // that completes the skill must find the bootstrap already
+            // pointing at the right directory.
+            record_installed(skill.clone());
+            record_trouble(trouble.clone());
+            tracing::error!(
+                path = %path.display(),
+                parts = skill.references.len(),
+                reason = %trouble.reason(),
+                refusing = matches!(trouble, SkillTrouble::Refusing { .. }),
+                "engram skill fetch: installed WITH GAPS"
             )
         }
         StartupOutcome::StartedNormally => {
@@ -1214,9 +1391,15 @@ pub async fn run_startup_fetch() -> Option<StartupOutcome> {
 
     // Item 7's refetch: while degraded, keep trying. A relay that was briefly
     // down otherwise leaves the agent on a stale skill until a restart.
+    // ⚠️ `InstalledWithGaps` is in this set deliberately: §7.1 says refuse
+    // "until a fetch delivers every part", so a partial delivery must keep
+    // retrying exactly like an outage does. Leaving it out would install the
+    // gap once and sit on it until someone restarted the agent.
     while matches!(
         outcome,
-        StartupOutcome::Degraded { .. } | StartupOutcome::RefuseTasks { .. }
+        StartupOutcome::Degraded { .. }
+            | StartupOutcome::RefuseTasks { .. }
+            | StartupOutcome::InstalledWithGaps { .. }
     ) {
         tokio::time::sleep(DEGRADED_RETRY_INTERVAL).await;
         tracing::info!("engram skill fetch: retrying after degradation");
@@ -2263,6 +2446,100 @@ mod fetch_tests {
         }
     }
 
+    // ── Item 6: `unreadable_parts` on the wire (seam v1.16 §7.1) ────────
+
+    fn assigned_with(extra: serde_json::Value) -> Fetched {
+        let mut v: serde_json::Value = serde_json::from_str(SPLIT).unwrap();
+        if let (Some(obj), Some(more)) = (v.as_object_mut(), extra.as_object()) {
+            for (k, val) in more {
+                obj.insert(k.clone(), val.clone());
+            }
+        }
+        interpret_payload(&v.to_string())
+    }
+
+    #[test]
+    fn a_complete_delivery_names_no_gaps() {
+        let f = interpret_payload(SPLIT);
+        assert_eq!(f.outcome, FetchOutcome::Assigned);
+        assert!(f.unreadable_parts.is_empty());
+        // An explicit empty list and an absent one must read the same.
+        let empty = assigned_with(serde_json::json!({"unreadable_parts": []}));
+        assert!(empty.unreadable_parts.is_empty());
+        let null = assigned_with(serde_json::json!({"unreadable_parts": null}));
+        assert!(null.unreadable_parts.is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_part_is_read_with_its_detail() {
+        let f = assigned_with(serde_json::json!({
+            "unreadable_parts": [
+                {"position": 3, "skill_id": "skill_abc", "reason": "not_readable"},
+                {"position": 5}
+            ]
+        }));
+        assert_eq!(f.outcome, FetchOutcome::Assigned, "the skill still arrived");
+        assert!(f.skill_md.is_some());
+        assert_eq!(f.unreadable_parts.len(), 2);
+        assert_eq!(f.unreadable_parts[0].position, Some(3));
+        assert_eq!(f.unreadable_parts[0].skill_id.as_deref(), Some("skill_abc"));
+        assert_eq!(f.unreadable_parts[1].position, Some(5));
+        assert_eq!(f.unreadable_parts[1].reason, None, "absent, not invented");
+    }
+
+    #[test]
+    fn a_part_missing_every_field_is_still_a_gap() {
+        // ⚠️ The shape that would make a gap invisible if the struct demanded
+        // its fields: serde would fail the whole list and we would install a
+        // partial skill reporting nothing wrong.
+        let f = assigned_with(serde_json::json!({"unreadable_parts": [{}]}));
+        assert_eq!(f.unreadable_parts.len(), 1);
+    }
+
+    #[test]
+    fn a_malformed_unreadable_parts_becomes_a_gap_rather_than_none() {
+        for raw in [
+            serde_json::json!("everything broke"),
+            serde_json::json!(7),
+            serde_json::json!({"position": 1}),
+            serde_json::json!([{"position": "third"}]),
+        ] {
+            let f = assigned_with(serde_json::json!({"unreadable_parts": raw.clone()}));
+            assert_eq!(
+                f.unreadable_parts.len(),
+                1,
+                "a breach must not read as a complete skill: {raw}"
+            );
+            assert!(
+                f.unreadable_parts[0]
+                    .reason
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("did not parse"),
+                "and it must say why: {:?}",
+                f.unreadable_parts[0]
+            );
+        }
+    }
+
+    #[test]
+    fn the_informational_lists_change_nothing() {
+        // §7.1: `name_collisions` and `duplicate_parts` are informational.
+        // They are logged; they must not reach `unreadable_parts` and must not
+        // keep the skill from installing.
+        let f = assigned_with(serde_json::json!({
+            "name_collisions": [{"name": "git-workflow", "positions": [2, 6], "source": "included"}],
+            "duplicate_parts": [{"skill_id": "s1", "version_id": "v1", "first_position": 2}]
+        }));
+        assert_eq!(f.outcome, FetchOutcome::Assigned);
+        assert!(f.skill_md.is_some());
+        assert!(
+            f.unreadable_parts.is_empty(),
+            "informational lists are not gaps"
+        );
+        assert_eq!(gap_trouble(&f.unreadable_parts, true), None);
+    }
+
     // ── Item 4: `require_assigned_skill` on the wire (seam v1.16 §7.1) ──
 
     #[test]
@@ -2770,6 +3047,136 @@ mod policy_tests {
         assert_eq!(script.calls(), 1, "a write failure must not retry");
     }
 
+    // ── Item 6: what a gap means (seam v1.16 §7.1) ──────────────────────
+
+    fn gap(position: u32, reason: &str) -> UnreadablePart {
+        UnreadablePart {
+            position: Some(position),
+            skill_id: Some("skill_abc".into()),
+            reason: Some(reason.into()),
+        }
+    }
+
+    #[test]
+    fn no_gaps_is_no_trouble_either_way() {
+        assert_eq!(gap_trouble(&[], true), None);
+        assert_eq!(gap_trouble(&[], false), None);
+    }
+
+    #[test]
+    fn a_gap_under_the_requirement_refuses_and_without_it_degrades() {
+        let gaps = [gap(3, "not_readable")];
+        match gap_trouble(&gaps, true) {
+            Some(SkillTrouble::Refusing { reason }) => {
+                assert!(reason.contains("1 part it could not read"), "{reason}");
+                assert!(reason.contains("position 3"), "{reason}");
+                assert!(reason.contains("not_readable"), "{reason}");
+            }
+            other => panic!("expected Refusing, got {other:?}"),
+        }
+        // Without the requirement the agent works on -- but the room is told,
+        // because a partial skill is a wrong answer with no explanation
+        // attached to it.
+        match gap_trouble(&gaps, false) {
+            Some(SkillTrouble::Degraded { reason }) => {
+                assert!(reason.contains("could not read"), "{reason}")
+            }
+            other => panic!("expected Degraded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_reason_counts_and_lists_every_gap() {
+        let gaps = [gap(3, "not_readable"), gap(5, "revoked")];
+        let reason = gap_trouble(&gaps, true).unwrap().reason().to_string();
+        assert!(reason.contains("2 parts"), "{reason}");
+        assert!(reason.contains("position 3"), "{reason}");
+        assert!(reason.contains("position 5"), "{reason}");
+    }
+
+    #[test]
+    fn a_gap_with_no_detail_still_reads_as_a_sentence() {
+        let bare = UnreadablePart {
+            position: None,
+            skill_id: None,
+            reason: None,
+        };
+        let reason = gap_trouble(&[bare], true).unwrap().reason().to_string();
+        assert!(reason.contains("1 part"), "{reason}");
+        assert!(reason.contains("unknown position"), "{reason}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_delivery_with_gaps_installs_the_files_and_refuses_under_the_requirement() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(root.path(), true);
+        let mut fetched = assigned();
+        fetched.unreadable_parts = vec![gap(3, "not_readable")];
+        let script = Script::new(vec![fetched]);
+
+        match fetch_with_policy(&cfg, &mut RequirementCache::new(), || async {
+            script.next()
+        })
+        .await
+        {
+            StartupOutcome::InstalledWithGaps {
+                path,
+                skill,
+                trouble,
+            } => {
+                assert_eq!(path, root.path().join("buzz-coder"));
+                assert_eq!(skill.references.len(), 7, "what DID arrive is installed");
+                assert!(matches!(trouble, SkillTrouble::Refusing { .. }));
+            }
+            other => panic!("expected InstalledWithGaps, got {other:?}"),
+        }
+        // The files are on disk either way: refusing is about turns, not bytes.
+        assert!(root.path().join("buzz-coder/SKILL.md").is_file());
+        assert_eq!(
+            script.calls(),
+            1,
+            "a delivered skill must not retry the ladder"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_same_delivery_without_the_requirement_degrades_instead() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(root.path(), false);
+        let mut fetched = assigned();
+        fetched.unreadable_parts = vec![gap(3, "not_readable")];
+        let script = Script::new(vec![fetched]);
+        match fetch_with_policy(&cfg, &mut RequirementCache::new(), || async {
+            script.next()
+        })
+        .await
+        {
+            StartupOutcome::InstalledWithGaps { trouble, .. } => {
+                assert!(
+                    matches!(trouble, SkillTrouble::Degraded { .. }),
+                    "a gap without the requirement must not stop the agent working"
+                )
+            }
+            other => panic!("expected InstalledWithGaps, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_complete_delivery_is_plain_installed() {
+        // The negative control for both tests above: the same path with no
+        // gaps must not produce a trouble at all.
+        let root = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(root.path(), true);
+        let script = Script::new(vec![assigned()]);
+        assert!(matches!(
+            fetch_with_policy(&cfg, &mut RequirementCache::new(), || async {
+                script.next()
+            })
+            .await,
+            StartupOutcome::Installed { .. }
+        ));
+    }
+
     // ── Item 4: precedence and the per-project cache (seam v1.16 §7.1) ──
 
     #[test]
@@ -2914,6 +3321,7 @@ mod policy_tests {
             outcome: FetchOutcome::Assigned,
             skill_md: None,
             require_assigned_skill: None,
+            unreadable_parts: Vec::new(),
         }]);
         match fetch_with_policy(&cfg, &mut RequirementCache::new(), || async {
             script.next()
