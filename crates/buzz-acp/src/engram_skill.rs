@@ -472,6 +472,100 @@ pub fn decide(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Item 4: whose `require_assigned_skill` wins (seam v1.16 §7.1).
+//
+// Three sources can have an opinion, and §7.1 orders them: the value in the
+// most recent response, then what an earlier response in this process said,
+// then the setting the harness holds locally (`ENGRAM_REQUIRE_ASSIGNED_SKILL`).
+// The last one applies **only** on a cold start with nothing yet observed.
+//
+// ⚠️ ONE AMBIGUITY, AND WE CHOSE A READING. §7.1 says the local setting applies
+// "only when no response has been seen for this project in this process". A
+// response that carries no such field has still been *seen*, so read strictly
+// that sentence would make the local setting inert the moment any response
+// arrives -- and against ENGRAM v1.20.4, where NO status carries the field, it
+// would make `ENGRAM_REQUIRE_ASSIGNED_SKILL` permanently dead on the first
+// fetch while looking like it worked. So we resolve on "no VALUE observed"
+// rather than "no response seen": absence never clears an explicit operator
+// setting, and it never escalates one either. That keeps §7.1's own stated
+// reason intact (an unreachable ENGRAM must not by itself make an agent
+// refuse) while leaving the operator's switch meaning something on a rollback.
+// Raised with ENGRAM Lead; `requirement_field_missing` is what makes the case
+// visible in the log rather than inferable.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// §7.1's precedence as one expression: the response, then the cache, then the
+/// local setting.
+///
+/// ⚠️ Deliberately **not** fail-closed. Refusing tasks whenever ENGRAM is
+/// unreachable would take every agent down during an outage -- a larger failure
+/// than the one the setting guards against, and §7.1 says so explicitly.
+pub fn effective_requirement(observed: Option<bool>, cached: Option<bool>, local: bool) -> bool {
+    observed.or(cached).unwrap_or(local)
+}
+
+/// True when a response on a status that §7.1 says carries
+/// `require_assigned_skill` did not carry it.
+///
+/// ⚠️ This is the rollback detector, and it is the reason the condition is a
+/// named function rather than an inline `is_none()`. On ENGRAM v1.20.4 every
+/// `assigned` and `no_skill_assigned` takes this branch, and the fallback that
+/// follows is then doing load-bearing work that nothing else would report.
+/// `Failed` and `SkillsDisabled` are excluded because neither is expected to
+/// carry it -- counting those would make the signal useless.
+pub fn requirement_field_missing(outcome: &FetchOutcome, observed: Option<bool>) -> bool {
+    observed.is_none()
+        && matches!(
+            outcome,
+            FetchOutcome::Assigned | FetchOutcome::NoSkillAssigned
+        )
+}
+
+/// The per-project cache §7.1 asks for: "the value in the most recent response
+/// wins; a harness caches it per project".
+///
+/// ⚠️ Deliberately **not** a process-wide static. Two reasons, one of them
+/// measured: `fetch_with_policy`'s own tests would then write shared state --
+/// the trap recorded on `StartupOutcome::Installed`, which cost a day once --
+/// and the thing that needs to outlive a single call is the degraded-retry loop
+/// in `run_startup_fetch`, which can own it. One process serves one
+/// `ENGRAM_PROJECT`, so the map has one entry in practice; it is keyed anyway
+/// because the contract is written for a harness that may serve several, and a
+/// cache that silently answers for the wrong project is the failure this key
+/// prevents.
+#[derive(Debug, Default)]
+pub struct RequirementCache {
+    seen: std::collections::HashMap<String, bool>,
+}
+
+impl RequirementCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a value a response actually carried.
+    ///
+    /// Only ever called with a real value: letting an absent field overwrite
+    /// what we were told is the one write that would turn a rollback into a
+    /// silent configuration change.
+    pub fn observe(&mut self, project: &str, value: bool) {
+        self.seen.insert(project.to_string(), value);
+    }
+
+    pub fn get(&self, project: &str) -> Option<bool> {
+        self.seen.get(project).copied()
+    }
+
+    /// Record what this response carried, then resolve the requirement for it.
+    pub fn resolve(&mut self, project: &str, observed: Option<bool>, local: bool) -> bool {
+        if let Some(value) = observed {
+            self.observe(project, value);
+        }
+        effective_requirement(observed, self.get(project), local)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Item 1: the fetch. `get_assigned_skill(project, format="skill_md")` over
 // streamable HTTP, reduced to a `FetchOutcome` plus the payload.
 //
@@ -488,6 +582,17 @@ pub struct Fetched {
     pub outcome: FetchOutcome,
     /// `Some` only when `outcome` is `Assigned`.
     pub skill_md: Option<SkillMd>,
+    /// The project's `require_assigned_skill` **as this response carried it**
+    /// (seam v1.16 §7.1).
+    ///
+    /// ⚠️ `None` is **not** `Some(false)`. It means the response said nothing
+    /// about it: `skills_disabled` carries no such field, a server older than
+    /// v1.16 carries it on no status at all, and a failed fetch never got a
+    /// payload. Collapsing absence to `false` would make a rollback to ENGRAM
+    /// v1.20.4 read as "this project does not require a skill", which is a
+    /// claim no response made -- and the precedence rule exists precisely to
+    /// keep those two cases apart.
+    pub require_assigned_skill: Option<bool>,
 }
 
 impl Fetched {
@@ -495,6 +600,7 @@ impl Fetched {
         Fetched {
             outcome: FetchOutcome::Failed(reason.into()),
             skill_md: None,
+            require_assigned_skill: None,
         }
     }
 
@@ -502,6 +608,16 @@ impl Fetched {
         Fetched {
             outcome,
             skill_md: None,
+            require_assigned_skill: None,
+        }
+    }
+
+    /// A result that carried the v1.16 field (or carried no value for it).
+    fn result(outcome: FetchOutcome, require_assigned_skill: Option<bool>) -> Self {
+        Fetched {
+            outcome,
+            skill_md: None,
+            require_assigned_skill,
         }
     }
 }
@@ -577,14 +693,41 @@ pub fn interpret_payload(text: &str) -> Fetched {
         None => return Fetched::failed("payload carried no `status` field"),
     };
 
+    // §7.1 [v1.16]: the field rides on `assigned` and on `no_skill_assigned`,
+    // so the harness never needs a second call. Read it here and nowhere else.
+    //
+    // A present-but-not-boolean value is a contract breach, and a quiet one --
+    // `as_bool()` would turn `"true"` into the same `None` as an absent field.
+    // It is read as absent (the skill itself is fine) and said out loud.
+    let require_assigned_skill = match value.get("require_assigned_skill") {
+        None => None,
+        Some(v) => match v.as_bool() {
+            Some(b) => Some(b),
+            None => {
+                tracing::warn!(
+                    value = %v,
+                    "get_assigned_skill: `require_assigned_skill` is not a boolean; \
+                     reading it as absent"
+                );
+                None
+            }
+        },
+    };
+
     match status {
-        "no_skill_assigned" => Fetched::plain(FetchOutcome::NoSkillAssigned),
+        "no_skill_assigned" => {
+            Fetched::result(FetchOutcome::NoSkillAssigned, require_assigned_skill)
+        }
+        // Not read on this status: §7.1 gives it no such field, and it outranks
+        // the requirement whatever is cached, so a value here could only
+        // mislead a later reader into thinking it mattered.
         "skills_disabled" => Fetched::plain(FetchOutcome::SkillsDisabled),
         "assigned" => match value.get("skill_md") {
             Some(raw) => match serde_json::from_value::<SkillMd>(raw.clone()) {
                 Ok(skill_md) => Fetched {
                     outcome: FetchOutcome::Assigned,
                     skill_md: Some(skill_md),
+                    require_assigned_skill,
                 },
                 Err(e) => Fetched::failed(format!("`skill_md` did not parse: {e}")),
             },
@@ -902,7 +1045,11 @@ pub enum StartupOutcome {
 ///
 /// Generic over the fetch so the ladder is tested against every branch without
 /// a network, with tokio's clock paused.
-pub async fn fetch_with_policy<F, Fut>(cfg: &SkillFetchConfig, mut fetch: F) -> StartupOutcome
+pub async fn fetch_with_policy<F, Fut>(
+    cfg: &SkillFetchConfig,
+    requirements: &mut RequirementCache,
+    mut fetch: F,
+) -> StartupOutcome
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Fetched>,
@@ -910,7 +1057,25 @@ where
     let mut attempts = 0;
     loop {
         let fetched = fetch().await;
-        match decide(&fetched.outcome, cfg.require_assigned_skill, attempts) {
+
+        // Item 4: the requirement is the project's, not the environment's --
+        // `cfg.require_assigned_skill` is now only the last resort.
+        if requirement_field_missing(&fetched.outcome, fetched.require_assigned_skill) {
+            tracing::warn!(
+                project = %cfg.project,
+                outcome = ?fetched.outcome,
+                "engram skill fetch: response carried no `require_assigned_skill`, which seam \
+                 v1.16 §7.1 says this status carries; falling back to the cache, then to \
+                 ENGRAM_REQUIRE_ASSIGNED_SKILL"
+            );
+        }
+        let require_assigned_skill = requirements.resolve(
+            &cfg.project,
+            fetched.require_assigned_skill,
+            cfg.require_assigned_skill,
+        );
+
+        match decide(&fetched.outcome, require_assigned_skill, attempts) {
             HarnessAction::InstallSkill => {
                 let Some(skill) = fetched.skill_md else {
                     // `Assigned` without a payload is refused by
@@ -987,7 +1152,14 @@ pub async fn run_startup_fetch() -> Option<StartupOutcome> {
         "engram skill fetch: starting"
     );
 
-    let mut outcome = fetch_with_policy(&cfg, || client.fetch(&cfg.project)).await;
+    // Owned here rather than inside `fetch_with_policy`, so that what a
+    // response said survives the degraded-retry loop below. Without that, a
+    // retry after an outage is a "cold start" by the contract's own wording and
+    // the local setting comes back -- see the item 4 banner.
+    let mut requirements = RequirementCache::new();
+
+    let mut outcome =
+        fetch_with_policy(&cfg, &mut requirements, || client.fetch(&cfg.project)).await;
 
     match &outcome {
         StartupOutcome::Installed { path, skill } => {
@@ -1022,7 +1194,7 @@ pub async fn run_startup_fetch() -> Option<StartupOutcome> {
     ) {
         tokio::time::sleep(DEGRADED_RETRY_INTERVAL).await;
         tracing::info!("engram skill fetch: retrying after degradation");
-        outcome = fetch_with_policy(&cfg, || client.fetch(&cfg.project)).await;
+        outcome = fetch_with_policy(&cfg, &mut requirements, || client.fetch(&cfg.project)).await;
         if let StartupOutcome::Installed { path, skill } = &outcome {
             record_installed(skill.clone());
             // Clears the marker, so the next wake in a channel that was told
@@ -1954,6 +2126,72 @@ mod fetch_tests {
         }
     }
 
+    // ── Item 4: `require_assigned_skill` on the wire (seam v1.16 §7.1) ──
+
+    #[test]
+    fn nothing_assigned_carries_the_requirement_both_ways() {
+        let on = interpret_payload(
+            r#"{"status":"no_skill_assigned","project_id":"project:1","require_assigned_skill":true}"#,
+        );
+        assert_eq!(on.outcome, FetchOutcome::NoSkillAssigned);
+        assert_eq!(on.require_assigned_skill, Some(true));
+
+        let off = interpret_payload(
+            r#"{"status":"no_skill_assigned","project_id":"project:1","require_assigned_skill":false}"#,
+        );
+        assert_eq!(off.outcome, FetchOutcome::NoSkillAssigned);
+        assert_eq!(off.require_assigned_skill, Some(false));
+    }
+
+    #[test]
+    fn an_assigned_payload_carries_it_without_displacing_the_skill() {
+        let mut v: serde_json::Value = serde_json::from_str(SPLIT).unwrap();
+        v["require_assigned_skill"] = serde_json::Value::Bool(true);
+        let f = interpret_payload(&v.to_string());
+        assert_eq!(f.outcome, FetchOutcome::Assigned);
+        assert_eq!(f.require_assigned_skill, Some(true));
+        assert!(
+            f.skill_md.is_some(),
+            "reading the new field must not cost us the payload"
+        );
+    }
+
+    #[test]
+    fn a_pre_v1_16_payload_carries_no_value_rather_than_false() {
+        // The recorded fixtures were taken from a v1.15 server, so this is the
+        // rollback shape measured rather than imagined: absence, not `false`.
+        assert_eq!(interpret_payload(SPLIT).require_assigned_skill, None);
+        assert_eq!(interpret_payload(SINGLE).require_assigned_skill, None);
+        assert_eq!(
+            interpret_payload(r#"{"status":"no_skill_assigned"}"#).require_assigned_skill,
+            None
+        );
+    }
+
+    #[test]
+    fn skills_disabled_carries_no_requirement_even_when_one_is_sent() {
+        let f = interpret_payload(r#"{"status":"skills_disabled","require_assigned_skill":true}"#);
+        assert_eq!(f.outcome, FetchOutcome::SkillsDisabled);
+        assert_eq!(
+            f.require_assigned_skill, None,
+            "§7.1 gives this status no such field, and it outranks the requirement anyway"
+        );
+    }
+
+    #[test]
+    fn a_non_boolean_requirement_reads_as_absent() {
+        // `as_bool()` answers `None` for `"true"` just as it does for a field
+        // that was never sent, so without this the two are indistinguishable.
+        // Reading it as absent is the safe half; the warn line is the loud half.
+        for raw in [r#""true""#, "1", "null", "[]", "{}"] {
+            let text =
+                format!(r#"{{"status":"no_skill_assigned","require_assigned_skill":{raw}}}"#);
+            let f = interpret_payload(&text);
+            assert_eq!(f.outcome, FetchOutcome::NoSkillAssigned, "{raw}");
+            assert_eq!(f.require_assigned_skill, None, "{raw}");
+        }
+    }
+
     #[test]
     fn an_unknown_status_names_the_value() {
         match interpret_payload(r#"{"status":"on_fire"}"#).outcome {
@@ -2234,7 +2472,10 @@ mod policy_tests {
         let root = tempfile::tempdir().unwrap();
         let cfg = test_cfg(root.path(), false);
         let script = Script::new(vec![assigned()]);
-        let out = fetch_with_policy(&cfg, || async { script.next() }).await;
+        let out = fetch_with_policy(&cfg, &mut RequirementCache::new(), || async {
+            script.next()
+        })
+        .await;
         match &out {
             StartupOutcome::Installed { path, skill } => {
                 assert_eq!(path, &root.path().join("buzz-coder"));
@@ -2260,7 +2501,10 @@ mod policy_tests {
             Fetched::failed("transport: connection refused"),
             assigned(),
         ]);
-        let out = fetch_with_policy(&cfg, || async { script.next() }).await;
+        let out = fetch_with_policy(&cfg, &mut RequirementCache::new(), || async {
+            script.next()
+        })
+        .await;
         assert!(matches!(out, StartupOutcome::Installed { .. }), "{out:?}");
         assert_eq!(script.calls(), 3);
     }
@@ -2282,7 +2526,10 @@ mod policy_tests {
             Fetched::failed("transport: timed out"),
         ]);
         let started = tokio::time::Instant::now();
-        let out = fetch_with_policy(&cfg, || async { script.next() }).await;
+        let out = fetch_with_policy(&cfg, &mut RequirementCache::new(), || async {
+            script.next()
+        })
+        .await;
         let waited = started.elapsed();
 
         match out {
@@ -2309,7 +2556,11 @@ mod policy_tests {
             Fetched::failed("transport: timed out"),
             Fetched::failed("transport: timed out"),
         ]);
-        match fetch_with_policy(&cfg, || async { script.next() }).await {
+        match fetch_with_policy(&cfg, &mut RequirementCache::new(), || async {
+            script.next()
+        })
+        .await
+        {
             StartupOutcome::RefuseTasks { reason } => {
                 assert!(reason.contains("require_assigned_skill"), "{reason}")
             }
@@ -2322,7 +2573,10 @@ mod policy_tests {
         let root = tempfile::tempdir().unwrap();
         let cfg = test_cfg(root.path(), false);
         let script = Script::new(vec![Fetched::plain(FetchOutcome::NoSkillAssigned)]);
-        let out = fetch_with_policy(&cfg, || async { script.next() }).await;
+        let out = fetch_with_policy(&cfg, &mut RequirementCache::new(), || async {
+            script.next()
+        })
+        .await;
         assert_eq!(out, StartupOutcome::StartedNormally);
         assert_eq!(script.calls(), 1, "a result must not retry");
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
@@ -2333,7 +2587,11 @@ mod policy_tests {
         let root = tempfile::tempdir().unwrap();
         let cfg = test_cfg(root.path(), true);
         let script = Script::new(vec![Fetched::plain(FetchOutcome::NoSkillAssigned)]);
-        match fetch_with_policy(&cfg, || async { script.next() }).await {
+        match fetch_with_policy(&cfg, &mut RequirementCache::new(), || async {
+            script.next()
+        })
+        .await
+        {
             StartupOutcome::RefuseTasks { .. } => {}
             other => panic!("expected RefuseTasks, got {other:?}"),
         }
@@ -2345,7 +2603,10 @@ mod policy_tests {
         let cfg = test_cfg(root.path(), true);
         let script = Script::new(vec![Fetched::plain(FetchOutcome::SkillsDisabled)]);
         assert_eq!(
-            fetch_with_policy(&cfg, || async { script.next() }).await,
+            fetch_with_policy(&cfg, &mut RequirementCache::new(), || async {
+                script.next()
+            })
+            .await,
             StartupOutcome::StartedNormally
         );
     }
@@ -2359,13 +2620,153 @@ mod policy_tests {
         std::fs::write(&blocked, b"i am a file").unwrap();
         let cfg = test_cfg(&blocked, false);
         let script = Script::new(vec![assigned()]);
-        match fetch_with_policy(&cfg, || async { script.next() }).await {
+        match fetch_with_policy(&cfg, &mut RequirementCache::new(), || async {
+            script.next()
+        })
+        .await
+        {
             StartupOutcome::Degraded { reason } => {
                 assert!(!reason.is_empty(), "a write failure must name something")
             }
             other => panic!("expected Degraded, got {other:?}"),
         }
         assert_eq!(script.calls(), 1, "a write failure must not retry");
+    }
+
+    // ── Item 4: precedence and the per-project cache (seam v1.16 §7.1) ──
+
+    #[test]
+    fn the_response_wins_then_the_cache_then_the_local_setting() {
+        // the response beats both
+        assert!(effective_requirement(Some(true), Some(false), false));
+        assert!(!effective_requirement(Some(false), Some(true), true));
+        // the cache beats the local setting
+        assert!(effective_requirement(None, Some(true), false));
+        assert!(!effective_requirement(None, Some(false), true));
+        // and the local setting applies only with nothing observed at all
+        assert!(effective_requirement(None, None, true));
+        assert!(!effective_requirement(None, None, false));
+    }
+
+    #[test]
+    fn an_absent_field_does_not_clear_what_a_response_said() {
+        let mut cache = RequirementCache::new();
+        assert!(cache.resolve("project:test", Some(true), false));
+        // Then a response that says nothing: a rollback, or a failed fetch.
+        assert!(
+            cache.resolve("project:test", None, false),
+            "absence is not `false`"
+        );
+        assert_eq!(cache.get("project:test"), Some(true));
+    }
+
+    #[test]
+    fn the_cache_answers_per_project_and_never_for_another() {
+        let mut cache = RequirementCache::new();
+        cache.observe("project:one", true);
+        assert_eq!(cache.get("project:two"), None);
+        assert!(!cache.resolve("project:two", None, false));
+    }
+
+    #[test]
+    fn the_missing_field_signal_fires_only_where_the_contract_promises_one() {
+        assert!(requirement_field_missing(&FetchOutcome::Assigned, None));
+        assert!(requirement_field_missing(
+            &FetchOutcome::NoSkillAssigned,
+            None
+        ));
+        assert!(!requirement_field_missing(
+            &FetchOutcome::Assigned,
+            Some(false)
+        ));
+        assert!(!requirement_field_missing(
+            &FetchOutcome::SkillsDisabled,
+            None
+        ));
+        assert!(!requirement_field_missing(
+            &FetchOutcome::Failed("transport: timed out".into()),
+            None
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_projects_requirement_overrides_an_unset_environment() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(root.path(), false);
+        let script = Script::new(vec![Fetched::result(
+            FetchOutcome::NoSkillAssigned,
+            Some(true),
+        )]);
+        match fetch_with_policy(&cfg, &mut RequirementCache::new(), || async {
+            script.next()
+        })
+        .await
+        {
+            StartupOutcome::RefuseTasks { reason } => {
+                assert!(reason.contains("require_assigned_skill"), "{reason}")
+            }
+            other => panic!("expected RefuseTasks, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_project_that_turns_it_off_beats_an_environment_that_turns_it_on() {
+        // The direction an operator gets wrong: ENGRAM is the authority, so a
+        // stale `ENGRAM_REQUIRE_ASSIGNED_SKILL=1` must not refuse tasks in a
+        // project that does not ask for it.
+        let root = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(root.path(), true);
+        let script = Script::new(vec![Fetched::result(
+            FetchOutcome::NoSkillAssigned,
+            Some(false),
+        )]);
+        assert_eq!(
+            fetch_with_policy(&cfg, &mut RequirementCache::new(), || async {
+                script.next()
+            })
+            .await,
+            StartupOutcome::StartedNormally
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cached_false_survives_an_outage_and_degrades_rather_than_refusing() {
+        // Why `run_startup_fetch` owns the cache rather than this function:
+        // ENGRAM said this project requires nothing, then went away. The local
+        // setting must not resurrect a requirement ENGRAM disowned.
+        let root = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(root.path(), true);
+        let mut cache = RequirementCache::new();
+
+        let first = Script::new(vec![Fetched::result(
+            FetchOutcome::NoSkillAssigned,
+            Some(false),
+        )]);
+        assert_eq!(
+            fetch_with_policy(&cfg, &mut cache, || async { first.next() }).await,
+            StartupOutcome::StartedNormally
+        );
+
+        // An exhausted script fails every call, which is the outage.
+        let outage = Script::new(vec![]);
+        match fetch_with_policy(&cfg, &mut cache, || async { outage.next() }).await {
+            StartupOutcome::Degraded { .. } => {}
+            other => panic!("expected Degraded, got {other:?}"),
+        }
+        assert_eq!(outage.calls(), 1 + FETCH_MAX_ATTEMPTS as usize);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn skills_disabled_outranks_a_cached_requirement() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(root.path(), false);
+        let mut cache = RequirementCache::new();
+        cache.observe("project:test", true);
+        let script = Script::new(vec![Fetched::plain(FetchOutcome::SkillsDisabled)]);
+        assert_eq!(
+            fetch_with_policy(&cfg, &mut cache, || async { script.next() }).await,
+            StartupOutcome::StartedNormally
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -2375,8 +2776,13 @@ mod policy_tests {
         let script = Script::new(vec![Fetched {
             outcome: FetchOutcome::Assigned,
             skill_md: None,
+            require_assigned_skill: None,
         }]);
-        match fetch_with_policy(&cfg, || async { script.next() }).await {
+        match fetch_with_policy(&cfg, &mut RequirementCache::new(), || async {
+            script.next()
+        })
+        .await
+        {
             StartupOutcome::Degraded { reason } => assert!(reason.contains("no files"), "{reason}"),
             other => panic!("expected Degraded, got {other:?}"),
         }
@@ -2552,7 +2958,10 @@ mod announcement_tests {
 
     #[test]
     fn recovery_is_announced_only_where_the_degradation_was() {
-        assert_eq!(decide_announcement(None, true), Some(Announcement::Recovered));
+        assert_eq!(
+            decide_announcement(None, true),
+            Some(Announcement::Recovered)
+        );
         // A room never told is never told of a recovery either -- otherwise the
         // first thing a quiet room hears is that something it never knew was
         // broken is fixed.
@@ -2566,14 +2975,20 @@ mod announcement_tests {
         });
         // Option B's phrasing is load-bearing in three clauses.
         assert!(body.contains("without my assigned skill"), "{body}");
-        assert!(body.contains("connection refused"), "the reason must reach the room: {body}");
+        assert!(
+            body.contains("connection refused"),
+            "the reason must reach the room: {body}"
+        );
         assert!(
             body.contains("I will answer") && body.contains("automatically"),
             "it must say work continues and that recovery needs no human: {body}"
         );
         // Guard 4 is about tags, which the relay parses out of the BODY. An '@'
         // here would wake whoever it named.
-        assert!(!body.contains('@'), "the announcement must mention nobody: {body}");
+        assert!(
+            !body.contains('@'),
+            "the announcement must mention nobody: {body}"
+        );
     }
 
     #[test]
