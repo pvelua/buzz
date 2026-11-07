@@ -627,6 +627,15 @@ impl AuthorizedNormalListenerEvent {
 
 struct QueuedNormalListenerEvent {
     accepted: bool,
+    /// Item 5: seen, acknowledged, and deliberately not queued, because this
+    /// project requires an assigned skill the agent does not have.
+    ///
+    /// ⚠️ Separate from `accepted` on purpose. A refused event must still get
+    /// the 👀 reaction: an unanswered mention with no reaction is how a dead
+    /// agent looks, and D20's refusal is explicitly a **live** agent. The
+    /// in-channel note says so once per room; the reaction is what says it on
+    /// every later message without spending a turn.
+    refused: bool,
     scope: scope::SessionScope,
     effective_author: String,
     event_id_hex: String,
@@ -636,7 +645,7 @@ struct QueuedNormalListenerEvent {
 
 impl QueuedNormalListenerEvent {
     fn mark_seen(&self, rest_client: &relay::RestClient) {
-        if !self.accepted {
+        if !self.accepted && !self.refused {
             return;
         }
         let rest_client = rest_client.clone();
@@ -698,6 +707,32 @@ impl NormalListenerIngress {
         if engram_skill::announcement_possible() {
             tokio::spawn(engram_skill::maybe_announce(channel_id));
         }
+        // Item 5 / D20: the project requires an assigned skill and this agent
+        // has none, so it takes no tasks -- and does NOT exit. Enforced here
+        // because this is the one place a wake becomes a turn; `decide()` has
+        // returned `RefuseTasks` since v1.2.0 and nothing consulted it, so the
+        // refusal was a log line and the agent worked on regardless.
+        //
+        // The event is dropped rather than queued: holding it would make the
+        // agent answer a backlog the moment the skill arrived, hours later, to
+        // a room that has moved on.
+        if let Some(reason) = engram_skill::refusing_reason() {
+            tracing::warn!(
+                channel = %channel_id,
+                event = %event_id_hex,
+                reason = %reason,
+                "refusing this task: the project requires an assigned skill and none is installed"
+            );
+            return QueuedNormalListenerEvent {
+                accepted: false,
+                refused: true,
+                scope: session_scope,
+                effective_author,
+                event_id_hex,
+                event_for_steer,
+                prompt_tag_for_steer,
+            };
+        }
         let accepted = queue.push(QueuedEvent {
             channel_id,
             scope: session_scope.clone(),
@@ -707,6 +742,7 @@ impl NormalListenerIngress {
         });
         QueuedNormalListenerEvent {
             accepted,
+            refused: false,
             scope: session_scope,
             effective_author,
             event_id_hex,
@@ -3596,8 +3632,10 @@ async fn run_harness(
                                 "admitted event — resolved session scope"
                             );
                             let queued = ingress.push(&mut queue, session_scope);
-                            // 👀 — immediate "seen" reaction, only if the event
-                            // was actually queued (not dropped by DedupMode::Drop).
+                            // 👀 — immediate "seen" reaction, if the event was
+                            // queued (not dropped by DedupMode::Drop) or was
+                            // refused under item 5, where the agent is alive
+                            // and deliberately not working.
                             // Fire-and-forget: on rare fast-failure paths the
                             // guard's cleanup may race with this add, leaving a
                             // cosmetic stale 👀. Acceptable — see ReactionGuard docs.
@@ -6001,6 +6039,95 @@ mod heartbeat_base_prompt_tests {
         let prompt = "[System: Heartbeat]\nrun feed get";
         let composed = pool::prepend_standing_for_legacy(2, &heartbeat_standing(), prompt);
         assert_eq!(composed, prompt);
+    }
+}
+
+#[cfg(test)]
+mod refusal_gate_tests {
+    use super::*;
+    use nostr::{EventBuilder, Keys, Kind};
+
+    /// A fresh wake in `channel_id`. A new event each call, because the queue
+    /// dedups by event id and a reused one would make the second push a no-op
+    /// for a reason that has nothing to do with the gate.
+    fn wake(channel_id: Uuid) -> NormalListenerIngress {
+        let keys = Keys::generate();
+        let event = EventBuilder::new(
+            Kind::Custom(KIND_STREAM_MESSAGE as u16),
+            "please look at the rain gauge data",
+        )
+        .sign_with_keys(&keys)
+        .unwrap();
+        NormalListenerIngress {
+            buzz_event: relay::BuzzEvent {
+                connection_generation: 0,
+                channel_id,
+                event,
+            },
+            effective_author: keys.public_key().to_hex(),
+            prompt_tag: "mention".into(),
+        }
+    }
+
+    /// Item 5 end to end through the one place a wake becomes a turn, with
+    /// both controls acceptance checks 4 and 5 ask for in the same test so
+    /// neither can be read without the other.
+    ///
+    /// `#[tokio::test]` because `push` spawns the announcement; a plain
+    /// `#[test]` panics in `tokio::spawn` with no runtime, which would look
+    /// like a failure of the gate.
+    #[tokio::test]
+    async fn a_refusing_agent_queues_nothing_while_a_degraded_one_still_works() {
+        let _serialised = engram_skill::state_test_guard();
+        engram_skill::clear_trouble();
+
+        let channel_id = Uuid::new_v4();
+        let scope = scope::SessionScope::Conversation { channel_id };
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+
+        // Control 1: healthy. The same wake becomes a turn.
+        let healthy = wake(channel_id).push(&mut queue, scope.clone());
+        assert!(healthy.accepted, "a healthy agent queues the wake");
+        assert!(!healthy.refused);
+        assert_eq!(queue.queued_event_count(scope.clone()), 1);
+
+        // The refusal.
+        engram_skill::record_trouble(engram_skill::SkillTrouble::Refusing {
+            reason: "no skill is assigned and this project sets require_assigned_skill".into(),
+        });
+        let refused = wake(channel_id).push(&mut queue, scope.clone());
+        assert!(!refused.accepted, "a refused wake must not become a turn");
+        assert!(
+            refused.refused,
+            "and it must be marked refused, which is what earns it the 👀 — a silent \
+             non-answer is how a dead agent looks"
+        );
+        assert_eq!(
+            queue.queued_event_count(scope.clone()),
+            1,
+            "the event is dropped, not held: a queued backlog would be answered hours later \
+             to a room that has moved on"
+        );
+
+        // Control 2 — acceptance check 5, and the one most likely to be
+        // skipped. Degraded is not a refusal; an agent without its skill
+        // answers worse, not never. A gate that fires here passes check 4 and
+        // is a broken feature.
+        engram_skill::record_trouble(engram_skill::SkillTrouble::Degraded {
+            reason: "engram unreachable".into(),
+        });
+        let degraded = wake(channel_id).push(&mut queue, scope.clone());
+        assert!(degraded.accepted, "a degraded agent still takes the task");
+        assert!(!degraded.refused);
+        assert_eq!(queue.queued_event_count(scope.clone()), 2);
+
+        // And it reopens with no restart, which is D20's whole point.
+        engram_skill::clear_trouble();
+        let recovered = wake(channel_id).push(&mut queue, scope.clone());
+        assert!(recovered.accepted);
+        assert_eq!(queue.queued_event_count(scope.clone()), 3);
+
+        engram_skill::clear_trouble();
     }
 }
 

@@ -1116,6 +1116,55 @@ where
     }
 }
 
+/// Record what an outcome means for the process-wide state, and say so.
+///
+/// ⚠️ **This is one function because the retry loop used to clear the marker
+/// only on `Installed`.** A retry that returned `StartedNormally` -- ENGRAM
+/// reachable again with nothing assigned, or the project's requirement turned
+/// off -- left the loop with the trouble marker still set. Under item 7 that
+/// cost a room its recovery line; under item 5 it is an agent that **refuses
+/// tasks forever after the condition has passed**, and it is the exact
+/// transition acceptance check 3 measures ("flipping the project setting
+/// changes behaviour with no container restart"). Found by reading the loop
+/// while building the gate, not by a test -- there was no test that could see
+/// it, because nothing consumed the marker.
+fn apply_outcome(outcome: &StartupOutcome, retry: bool) {
+    match outcome {
+        StartupOutcome::Installed { path, skill } => {
+            record_installed(skill.clone());
+            // Clears the marker, so the next wake in a channel that was told
+            // carries the recovery line rather than silence.
+            clear_trouble();
+            tracing::info!(
+                path = %path.display(),
+                parts = skill.references.len(),
+                "engram skill fetch: {}",
+                if retry { "recovered and installed" } else { "installed" }
+            )
+        }
+        StartupOutcome::StartedNormally => {
+            // Includes `no_skill_assigned`, which is a RESULT and never degraded.
+            clear_trouble();
+            tracing::info!(
+                recovered = retry,
+                "engram skill fetch: nothing assigned, starting normally"
+            )
+        }
+        StartupOutcome::Degraded { reason } => {
+            record_trouble(SkillTrouble::Degraded {
+                reason: reason.clone(),
+            });
+            tracing::error!(reason = %reason, "engram skill fetch: DEGRADED")
+        }
+        StartupOutcome::RefuseTasks { reason } => {
+            record_trouble(SkillTrouble::Refusing {
+                reason: reason.clone(),
+            });
+            tracing::error!(reason = %reason, "engram skill fetch: refusing tasks")
+        }
+    }
+}
+
 /// The whole startup path: read the config, fetch, write, and log what happened.
 ///
 /// Spawned, never awaited by startup. Returns the outcome so a caller that has
@@ -1161,30 +1210,7 @@ pub async fn run_startup_fetch() -> Option<StartupOutcome> {
     let mut outcome =
         fetch_with_policy(&cfg, &mut requirements, || client.fetch(&cfg.project)).await;
 
-    match &outcome {
-        StartupOutcome::Installed { path, skill } => {
-            record_installed(skill.clone());
-            clear_degraded();
-            tracing::info!(
-                path = %path.display(),
-                parts = skill.references.len(),
-                "engram skill fetch: installed"
-            )
-        }
-        StartupOutcome::StartedNormally => {
-            // Includes `no_skill_assigned`, which is a RESULT and never degraded.
-            clear_degraded();
-            tracing::info!("engram skill fetch: nothing assigned, starting normally")
-        }
-        StartupOutcome::Degraded { reason } => {
-            record_degraded(reason.clone());
-            tracing::error!(reason = %reason, "engram skill fetch: DEGRADED")
-        }
-        StartupOutcome::RefuseTasks { reason } => {
-            record_degraded(reason.clone());
-            tracing::error!(reason = %reason, "engram skill fetch: refusing tasks")
-        }
-    }
+    apply_outcome(&outcome, false);
 
     // Item 7's refetch: while degraded, keep trying. A relay that was briefly
     // down otherwise leaves the agent on a stale skill until a restart.
@@ -1195,16 +1221,7 @@ pub async fn run_startup_fetch() -> Option<StartupOutcome> {
         tokio::time::sleep(DEGRADED_RETRY_INTERVAL).await;
         tracing::info!("engram skill fetch: retrying after degradation");
         outcome = fetch_with_policy(&cfg, &mut requirements, || client.fetch(&cfg.project)).await;
-        if let StartupOutcome::Installed { path, skill } = &outcome {
-            record_installed(skill.clone());
-            // Clears the marker, so the next wake in a channel that was told
-            // carries the recovery line rather than silence.
-            clear_degraded();
-            tracing::info!(
-                path = %path.display(),
-                "engram skill fetch: recovered and installed"
-            );
-        }
+        apply_outcome(&outcome, true);
     }
 
     Some(outcome)
@@ -1383,38 +1400,115 @@ pub fn bootstrap_text(skill: Option<&InstalledSkill>) -> Option<String> {
 // that saw the announcement believes the agent is degraded forever — which §7b's
 // table listed as option A's cost. This is the answer to that cost.
 
-/// Set while the fetch has failed its last retry; cleared when a later fetch
-/// installs a skill. `None` means "not degraded", which is **not** the same as
-/// "no skill installed" — see guard 1.
-static DEGRADED: std::sync::OnceLock<std::sync::RwLock<Option<String>>> =
-    std::sync::OnceLock::new();
-
-fn degraded_slot() -> &'static std::sync::RwLock<Option<String>> {
-    DEGRADED.get_or_init(|| std::sync::RwLock::new(None))
+/// What is wrong, and whether it stops the agent working.
+///
+/// ⚠️ The two are **not** interchangeable, and conflating them was already
+/// shipping a false statement: a `Degraded` agent answers from its general
+/// instructions, a `Refusing` one takes no tasks at all (D20). Item 7 recorded
+/// both as a bare reason string, so a refusing agent announced
+/// *"I will answer from my general instructions"* and would then -- once item 5
+/// gated the turn -- answer nothing. The room would have been told the one
+/// thing that was not true.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillTrouble {
+    /// Up without the assigned skill. Answers, worse.
+    Degraded { reason: String },
+    /// `require_assigned_skill` with no skill: takes no tasks, stays up.
+    Refusing { reason: String },
 }
 
-/// Channels that have been told, and not yet told of a recovery.
-static TOLD: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-    std::sync::OnceLock::new();
+impl SkillTrouble {
+    pub fn reason(&self) -> &str {
+        match self {
+            SkillTrouble::Degraded { reason } | SkillTrouble::Refusing { reason } => reason,
+        }
+    }
 
-fn told_slot() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
-    TOLD.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
-}
-
-pub fn record_degraded(reason: impl Into<String>) {
-    if let Ok(mut slot) = degraded_slot().write() {
-        *slot = Some(reason.into());
+    /// Which **kind** this is, for the per-channel record of what a room was
+    /// told. Compared rather than the reason, because a reason that changes
+    /// between retries is not news and a kind that changes always is.
+    pub fn kind(&self) -> TroubleKind {
+        match self {
+            SkillTrouble::Degraded { .. } => TroubleKind::Degraded,
+            SkillTrouble::Refusing { .. } => TroubleKind::Refusing,
+        }
     }
 }
 
-pub fn clear_degraded() {
-    if let Ok(mut slot) = degraded_slot().write() {
+/// `SkillTrouble` without its reason: what a channel has been told.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TroubleKind {
+    Degraded,
+    Refusing,
+}
+
+/// Set while the fetch has failed its last retry, or while the project requires
+/// a skill the agent does not have; cleared by any later fetch that resolves.
+/// `None` means "no trouble", which is **not** the same as "no skill
+/// installed" — see guard 1.
+static TROUBLE: std::sync::OnceLock<std::sync::RwLock<Option<SkillTrouble>>> =
+    std::sync::OnceLock::new();
+
+fn trouble_slot() -> &'static std::sync::RwLock<Option<SkillTrouble>> {
+    TROUBLE.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+/// Channels that have been told, and **what** they were told, so that a
+/// Degraded → Refusing transition is announced rather than swallowed by "this
+/// room already knows".
+static TOLD: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, TroubleKind>>> =
+    std::sync::OnceLock::new();
+
+fn told_slot() -> &'static std::sync::Mutex<std::collections::HashMap<String, TroubleKind>> {
+    TOLD.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+pub fn record_trouble(trouble: SkillTrouble) {
+    if let Ok(mut slot) = trouble_slot().write() {
+        *slot = Some(trouble);
+    }
+}
+
+pub fn clear_trouble() {
+    if let Ok(mut slot) = trouble_slot().write() {
         *slot = None;
     }
 }
 
-pub fn degraded_reason() -> Option<String> {
-    degraded_slot().read().ok().and_then(|slot| slot.clone())
+pub fn trouble() -> Option<SkillTrouble> {
+    trouble_slot().read().ok().and_then(|slot| slot.clone())
+}
+
+/// A lock for any test that drives this module's process-wide slots.
+///
+/// ⚠️ `pub(crate)` on purpose. The slots are process-wide, and `lib.rs` has a
+/// test for item 5's gate that sets them too. A lock private to one test
+/// module serialises that module and nothing else — which looks like
+/// serialisation and is not, and is the exact failure already recorded on
+/// `announcement_tests`.
+#[cfg(test)]
+pub(crate) static STATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Takes the lock without caring whether a previous panic poisoned it: a
+/// failing test should report its own assertion, not drag the next one down
+/// with a poison error that hides it.
+#[cfg(test)]
+pub(crate) fn state_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Item 5's gate, read on the inbound path: `Some(reason)` means take no tasks.
+///
+/// One uncontended lock read per accepted event, which is the budget the
+/// inbound path already sets for `announcement_possible`. It is deliberately
+/// **not** nested inside that check even though `announcement_possible` is
+/// true whenever this is: the gate would then stop firing if that predicate's
+/// definition ever changed, and nothing would report it.
+pub fn refusing_reason() -> Option<String> {
+    match trouble() {
+        Some(SkillTrouble::Refusing { reason }) => Some(reason),
+        _ => None,
+    }
 }
 
 /// What, if anything, to say in a channel right now.
@@ -1422,25 +1516,46 @@ pub fn degraded_reason() -> Option<String> {
 pub enum Announcement {
     /// First wake in this channel while degraded.
     Degraded { reason: String },
-    /// The skill arrived after this channel had been told it was missing.
+    /// First wake in this channel while refusing tasks (item 5 / D20).
+    Refusing { reason: String },
+    /// The trouble passed after this channel had been told about it.
     Recovered,
 }
 
 /// The policy, over explicit inputs so every branch is testable without the
 /// process-wide slots.
-pub fn decide_announcement(degraded: Option<&str>, already_told: bool) -> Option<Announcement> {
-    match (degraded, already_told) {
-        // Degraded and this room does not know yet.
-        (Some(reason), false) => Some(Announcement::Degraded {
-            reason: reason.to_string(),
-        }),
-        // Degraded and already said so: silence. Guard 3.
-        (Some(_), true) => None,
-        // Recovered, and this room was told. Close the loop.
-        (None, true) => Some(Announcement::Recovered),
+///
+/// `told` is **what** this room was told, not merely whether it was told
+/// something: a room told "degraded" and then silently switched to refusing
+/// would be holding a statement that is no longer true.
+pub fn decide_announcement(
+    trouble: Option<&SkillTrouble>,
+    told: Option<TroubleKind>,
+) -> Option<Announcement> {
+    match (trouble, told) {
+        // In trouble and this room does not know yet.
+        (Some(t), None) => Some(announcement_of(t)),
+        // In trouble, and the room was told something else. The kind changed,
+        // which is news; the reason changing is not.
+        (Some(t), Some(k)) if t.kind() != k => Some(announcement_of(t)),
+        // In trouble and already said so: silence. Guard 3.
+        (Some(_), Some(_)) => None,
+        // Resolved, and this room was told. Close the loop.
+        (None, Some(_)) => Some(Announcement::Recovered),
         // Healthy, nothing said: the overwhelmingly common case, and it must
         // cost nothing. Guards 1 and 2 both land here.
-        (None, false) => None,
+        (None, None) => None,
+    }
+}
+
+fn announcement_of(t: &SkillTrouble) -> Announcement {
+    match t {
+        SkillTrouble::Degraded { reason } => Announcement::Degraded {
+            reason: reason.clone(),
+        },
+        SkillTrouble::Refusing { reason } => Announcement::Refusing {
+            reason: reason.clone(),
+        },
     }
 }
 
@@ -1448,7 +1563,7 @@ pub fn decide_announcement(degraded: Option<&str>, already_told: bool) -> Option
 /// event**. The steady state is a healthy agent with nothing to say, and that
 /// case must cost two lock reads and no task — not a spawned future per event.
 pub fn announcement_possible() -> bool {
-    degraded_reason().is_some()
+    trouble().is_some()
         || told_slot()
             .lock()
             .map(|told| !told.is_empty())
@@ -1458,12 +1573,15 @@ pub fn announcement_possible() -> bool {
 /// `decide_announcement` against the process-wide state, recording what was
 /// said so it is not said twice.
 pub fn announcement_for(channel: &str) -> Option<Announcement> {
-    let degraded = degraded_reason();
+    let trouble = trouble();
     let mut told = told_slot().lock().ok()?;
-    let decision = decide_announcement(degraded.as_deref(), told.contains(channel));
+    let decision = decide_announcement(trouble.as_ref(), told.get(channel).copied());
     match &decision {
         Some(Announcement::Degraded { .. }) => {
-            told.insert(channel.to_string());
+            told.insert(channel.to_string(), TroubleKind::Degraded);
+        }
+        Some(Announcement::Refusing { .. }) => {
+            told.insert(channel.to_string(), TroubleKind::Refusing);
         }
         Some(Announcement::Recovered) => {
             told.remove(channel);
@@ -1490,13 +1608,28 @@ pub fn announcement_body(a: &Announcement) -> String {
              automatically once ENGRAM is reachable again. Until then, treat my answers here \
              as missing this project's specific conventions."
         ),
+        // Item 5 / D20. Says the three things a room needs and nothing it does
+        // not: that no work will happen, why, and that nobody needs to restart
+        // anything. ⚠️ It must NOT reuse the degraded wording -- "I will answer
+        // from my general instructions" is the one sentence that is false here.
+        Announcement::Refusing { reason } => format!(
+            "I am not taking tasks in this project: it requires an assigned skill and I do not \
+             have one ({reason}). I am still running and still watching this channel, so there \
+             is nothing to restart — I will pick work up again as soon as a fetch delivers the \
+             skill, or as soon as the project stops requiring one."
+        ),
         // ⚠️ Deliberately neutral about the skill itself. The retry loop can go
         // from Degraded to `no_skill_assigned` -- ENGRAM reachable again, nothing
         // assigned -- and "my skill has arrived" would then be a false statement
         // to the room. What recovered is the REACHABILITY, which is what the
         // degraded note actually claimed was broken.
-        Announcement::Recovered => "ENGRAM is reachable again, so the degraded note \
-             above no longer applies."
+        //
+        // ⚠️ It also covers the recovery from Refusing, where what changed may
+        // be the project's setting rather than anything about ENGRAM. "No
+        // longer applies" is true in both cases; naming a cause would be a
+        // guess in one of them.
+        Announcement::Recovered => "The note above no longer applies — I am working \
+             normally again."
             .to_string(),
     }
 }
@@ -1530,7 +1663,7 @@ pub async fn maybe_announce(channel_id: uuid::Uuid) {
     let Some(announcer) = ANNOUNCER.get() else {
         tracing::warn!(
             channel = %channel_id,
-            "degraded announcement decided but no announcer is registered; nothing was posted"
+            "skill-state announcement decided but no announcer is registered; nothing was posted"
         );
         return;
     };
@@ -1539,7 +1672,7 @@ pub async fn maybe_announce(channel_id: uuid::Uuid) {
     let built = match buzz_sdk::build_message(channel_id, &body, None, &[], false, &[], &[]) {
         Ok(b) => b,
         Err(e) => {
-            tracing::warn!(error = %e, "could not build the degraded announcement");
+            tracing::warn!(error = %e, "could not build the skill-state announcement");
             return;
         }
     };
@@ -1547,12 +1680,16 @@ pub async fn maybe_announce(channel_id: uuid::Uuid) {
         Ok(signed) => match announcer.publisher.publish_event(signed).await {
             Ok(_) => tracing::info!(
                 channel = %channel_id,
-                recovered = matches!(a, Announcement::Recovered),
-                "degraded announcement posted"
+                kind = match &a {
+                    Announcement::Degraded { .. } => "degraded",
+                    Announcement::Refusing { .. } => "refusing",
+                    Announcement::Recovered => "recovered",
+                },
+                "skill-state announcement posted"
             ),
-            Err(e) => tracing::warn!(error = %e, "could not publish the degraded announcement"),
+            Err(e) => tracing::warn!(error = %e, "could not publish the skill-state announcement"),
         },
-        Err(e) => tracing::warn!(error = %e, "could not sign the degraded announcement"),
+        Err(e) => tracing::warn!(error = %e, "could not sign the skill-state announcement"),
     }
 }
 
@@ -2921,15 +3058,28 @@ mod announcement_tests {
     ///
     /// ⚠️ Naming distinct channels per test is NOT enough, which is how this
     /// was first written and how it failed: `TOLD` is per channel but
-    /// `DEGRADED` is one global marker, so `record_degraded` in either test
+    /// `TROUBLE` is one global marker, so `record_trouble` in either test
     /// made the other's "healthy: silence" assertion flap. Serialise them.
-    static STATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Takes the lock without caring whether a previous panic poisoned it: a
-    /// failing test should report its own assertion, not drag the next one down
-    /// with a poison error that hides it.
+    ///
+    /// The lock itself is `super::STATE_TEST_LOCK`, shared with `lib.rs`'s
+    /// gate test — a second lock here would serialise this module against
+    /// itself and nothing else.
     fn state_guard() -> std::sync::MutexGuard<'static, ()> {
-        STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        state_test_guard()
+    }
+
+    /// `decide_announcement` takes a borrowed trouble, and a test that builds
+    /// one inline would drop it at the end of the argument list.
+    fn degraded(reason: &str) -> Option<SkillTrouble> {
+        Some(SkillTrouble::Degraded {
+            reason: reason.into(),
+        })
+    }
+
+    fn refusing(reason: &str) -> Option<SkillTrouble> {
+        Some(SkillTrouble::Refusing {
+            reason: reason.into(),
+        })
     }
 
     // Guard 1 and guard 2 share a branch, and that is the point: keying on an
@@ -2937,14 +3087,14 @@ mod announcement_tests {
     // both silent without either needing its own check.
     #[test]
     fn a_healthy_agent_says_nothing_however_often_it_is_woken() {
-        assert_eq!(decide_announcement(None, false), None);
-        assert_eq!(decide_announcement(None, false), None);
+        assert_eq!(decide_announcement(None, None), None);
+        assert_eq!(decide_announcement(None, None), None);
     }
 
     #[test]
     fn a_degraded_agent_tells_a_room_that_does_not_know() {
         assert_eq!(
-            decide_announcement(Some("engram unreachable"), false),
+            decide_announcement(degraded("engram unreachable").as_ref(), None),
             Some(Announcement::Degraded {
                 reason: "engram unreachable".into()
             })
@@ -2953,19 +3103,30 @@ mod announcement_tests {
 
     #[test]
     fn it_does_not_tell_the_same_room_twice() {
-        assert_eq!(decide_announcement(Some("engram unreachable"), true), None);
+        assert_eq!(
+            decide_announcement(
+                degraded("engram unreachable").as_ref(),
+                Some(TroubleKind::Degraded)
+            ),
+            None
+        );
     }
 
     #[test]
     fn recovery_is_announced_only_where_the_degradation_was() {
         assert_eq!(
-            decide_announcement(None, true),
+            decide_announcement(None, Some(TroubleKind::Degraded)),
             Some(Announcement::Recovered)
+        );
+        assert_eq!(
+            decide_announcement(None, Some(TroubleKind::Refusing)),
+            Some(Announcement::Recovered),
+            "a room told about a refusal is owed the same close"
         );
         // A room never told is never told of a recovery either -- otherwise the
         // first thing a quiet room hears is that something it never knew was
         // broken is fixed.
-        assert_eq!(decide_announcement(None, false), None);
+        assert_eq!(decide_announcement(None, None), None);
     }
 
     #[test]
@@ -2992,9 +3153,16 @@ mod announcement_tests {
     }
 
     #[test]
-    fn the_recovery_body_claims_reachability_rather_than_a_skill() {
+    fn the_recovery_body_claims_neither_a_skill_nor_a_cause() {
         let body = announcement_body(&Announcement::Recovered);
-        assert!(body.contains("reachable again"), "{body}");
+        assert!(body.contains("no longer applies"), "{body}");
+        // ⚠️ It used to say "ENGRAM is reachable again", which is FALSE for the
+        // recovery that matters most to item 5: a project that stops requiring
+        // a skill while ENGRAM was reachable throughout.
+        assert!(
+            !body.to_lowercase().contains("reachable"),
+            "the recovery must not name a cause it cannot know: {body}"
+        );
         // The retry loop can recover into `no_skill_assigned`, where a claim
         // that the skill arrived would be false.
         assert!(
@@ -3004,23 +3172,172 @@ mod announcement_tests {
         assert!(!body.contains('@'), "{body}");
     }
 
+    // ── Item 5: the refusal (D20, seam v1.16 §7.1) ──────────────────────
+
+    #[test]
+    fn a_refusing_agent_tells_a_room_it_is_not_working_rather_than_that_it_is() {
+        assert_eq!(
+            decide_announcement(refusing("no skill is assigned").as_ref(), None),
+            Some(Announcement::Refusing {
+                reason: "no skill is assigned".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_room_told_degraded_is_told_again_when_the_agent_starts_refusing() {
+        // ⚠️ The case the old `bool` could not express. The retry loop can go
+        // Degraded → RefuseTasks (ENGRAM comes back, the project requires a
+        // skill, none is assigned). A room holding "I will answer from my
+        // general instructions" would then get silence, which is the one
+        // outcome that makes the earlier message a lie.
+        assert_eq!(
+            decide_announcement(
+                refusing("still nothing assigned").as_ref(),
+                Some(TroubleKind::Degraded)
+            ),
+            Some(Announcement::Refusing {
+                reason: "still nothing assigned".into()
+            })
+        );
+        // And the other direction, which is just as wrong to swallow: a room
+        // told "I take no tasks" must hear that work has resumed, degraded.
+        assert_eq!(
+            decide_announcement(
+                degraded("engram unreachable").as_ref(),
+                Some(TroubleKind::Refusing)
+            ),
+            Some(Announcement::Degraded {
+                reason: "engram unreachable".into()
+            })
+        );
+    }
+
+    #[test]
+    fn the_same_kind_twice_is_still_silence_whatever_the_reason_says() {
+        // A reason that changes between retries ("timed out" → "connection
+        // refused") is not news to a room, and announcing it would turn the
+        // retry loop into a ticker.
+        assert_eq!(
+            decide_announcement(refusing("reason A").as_ref(), Some(TroubleKind::Refusing)),
+            None
+        );
+        assert_eq!(
+            decide_announcement(degraded("reason B").as_ref(), Some(TroubleKind::Degraded)),
+            None
+        );
+    }
+
+    #[test]
+    fn the_refusing_body_says_no_work_and_no_restart_and_names_no_one() {
+        let body = announcement_body(&Announcement::Refusing {
+            reason: "no skill is assigned and this project sets require_assigned_skill".into(),
+        });
+        assert!(body.contains("not taking tasks"), "{body}");
+        assert!(
+            body.contains("require_assigned_skill"),
+            "the reason must reach the room: {body}"
+        );
+        assert!(
+            body.contains("still running") && body.contains("nothing to restart"),
+            "D20 is explicit that the agent stays up -- a room that reads this as a crash will \
+             bounce the container: {body}"
+        );
+        // ⚠️ The sentence this must NOT contain. The degraded note promises work
+        // continues; here it does not.
+        assert!(
+            !body.contains("I will answer"),
+            "the refusal must not reuse the degraded promise: {body}"
+        );
+        assert!(
+            !body.contains('@'),
+            "guard 4: the announcement mentions nobody: {body}"
+        );
+    }
+
+    #[test]
+    fn refusing_reason_is_the_gate_and_degraded_does_not_open_it() {
+        let _serialised = state_guard();
+        clear_trouble();
+        assert_eq!(refusing_reason(), None, "healthy: the gate is open");
+
+        record_trouble(SkillTrouble::Degraded {
+            reason: "engram unreachable".into(),
+        });
+        assert_eq!(
+            refusing_reason(),
+            None,
+            "a degraded agent still works -- this is acceptance check 5, and a gate that \
+             fires here would look like a working feature while being broken"
+        );
+
+        record_trouble(SkillTrouble::Refusing {
+            reason: "no skill is assigned".into(),
+        });
+        assert_eq!(refusing_reason(), Some("no skill is assigned".to_string()));
+
+        clear_trouble();
+        assert_eq!(refusing_reason(), None, "and it reopens without a restart");
+    }
+
+    #[test]
+    fn a_retry_that_resolves_without_installing_still_clears_the_marker() {
+        // ⚠️ The bug `apply_outcome` exists to kill. The retry loop cleared the
+        // marker only on `Installed`, so a retry that answered
+        // `no_skill_assigned` -- ENGRAM back, nothing assigned, or the project
+        // no longer requiring one -- exited with the agent still refusing. The
+        // only route back was a restart, which is precisely what D20 says must
+        // not be necessary.
+        //
+        // `StartedNormally` is chosen deliberately: it writes no `INSTALLED`,
+        // so this test cannot leak a skill into another test's system prompt.
+        let _serialised = state_guard();
+        clear_trouble();
+        record_trouble(SkillTrouble::Refusing {
+            reason: "no skill is assigned".into(),
+        });
+        assert!(refusing_reason().is_some(), "precondition");
+
+        apply_outcome(&StartupOutcome::StartedNormally, true);
+        assert_eq!(
+            refusing_reason(),
+            None,
+            "a resolved retry must reopen the gate with no restart"
+        );
+        assert_eq!(trouble(), None);
+        clear_trouble();
+    }
+
+    #[test]
+    fn a_trouble_knows_its_own_kind_and_reason() {
+        let d = SkillTrouble::Degraded { reason: "x".into() };
+        let r = SkillTrouble::Refusing { reason: "y".into() };
+        assert_eq!(d.kind(), TroubleKind::Degraded);
+        assert_eq!(r.kind(), TroubleKind::Refusing);
+        assert_ne!(d.kind(), r.kind());
+        assert_eq!(d.reason(), "x");
+        assert_eq!(r.reason(), "y");
+    }
+
     #[test]
     fn the_per_channel_state_round_trips() {
         let _serialised = state_guard();
         let ch = "round-trip-channel-a";
-        clear_degraded();
+        clear_trouble();
         told_slot().lock().unwrap().remove(ch);
 
         assert_eq!(announcement_for(ch), None, "healthy: silence");
 
-        record_degraded("engram timed out");
+        record_trouble(SkillTrouble::Degraded {
+            reason: "engram timed out".into(),
+        });
         match announcement_for(ch) {
             Some(Announcement::Degraded { reason }) => assert_eq!(reason, "engram timed out"),
             other => panic!("expected a degraded announcement, got {other:?}"),
         }
         assert_eq!(announcement_for(ch), None, "and not a second time");
 
-        clear_degraded();
+        clear_trouble();
         assert_eq!(
             announcement_for(ch),
             Some(Announcement::Recovered),
@@ -3034,13 +3351,15 @@ mod announcement_tests {
         let _serialised = state_guard();
         let a = "independent-channel-a";
         let b = "independent-channel-b";
-        clear_degraded();
+        clear_trouble();
         {
             let mut told = told_slot().lock().unwrap();
             told.remove(a);
             told.remove(b);
         }
-        record_degraded("engram unreachable");
+        record_trouble(SkillTrouble::Degraded {
+            reason: "engram unreachable".into(),
+        });
         assert!(matches!(
             announcement_for(a),
             Some(Announcement::Degraded { .. })
@@ -3050,7 +3369,7 @@ mod announcement_tests {
             matches!(announcement_for(b), Some(Announcement::Degraded { .. })),
             "an agent in five channels announces in each -- once"
         );
-        clear_degraded();
+        clear_trouble();
         told_slot().lock().unwrap().remove(a);
         told_slot().lock().unwrap().remove(b);
     }
