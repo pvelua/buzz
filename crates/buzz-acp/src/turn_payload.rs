@@ -9,9 +9,9 @@
 //! digest of the first body. A retry with the same key and different bytes is
 //! `409 [turn_key_conflict]`, terminal. So the sender (D1d) retries the bytes
 //! made here, and nothing downstream may re-run [`build_record`] for a turn
-//! (API note `f7f263de`, "Idempotency").
+//! (API note `03f40ec8`, "Idempotency").
 //!
-//! Contract: API note KB `f7f263de`; design *Agent Skills Phase 1 —
+//! Contract: API note KB `03f40ec8`; design *Agent Skills Phase 1 —
 //! Observation* KB `195da706` §3.
 
 use crate::turn_record::TurnObservation;
@@ -44,7 +44,7 @@ impl TurnOutcome {
     }
 }
 
-/// ENGRAM's mapping (API note `97f63175`), in precedence order:
+/// ENGRAM's mapping (API note `03f40ec8`), in precedence order:
 ///
 /// 1. `failed` (the turn ended in a protocol or process failure) → `error`;
 /// 2. ACP `refusal` → `refused`;
@@ -53,9 +53,9 @@ impl TurnOutcome {
 /// 4. anything else, `end_turn`, `cancelled` and unknown values included →
 ///    `answered`.
 ///
-/// ⚠️ Our own `require_assigned_skill` refusal never reaches this: it drops
-/// the event before a turn exists (`lib.rs`, item 5), so there is no session
-/// and no record. ENGRAM's `refused` for it is unreachable from a turn.
+/// Our own `require_assigned_skill` refusal makes NO record: it drops the
+/// event before a turn exists (`lib.rs`, item 5). Agreed with ENGRAM as
+/// option (a), and written into API note `03f40ec8`.
 pub(crate) fn turn_outcome(
     stop_raw: Option<&str>,
     failed: bool,
@@ -134,8 +134,9 @@ fn rfc3339(t: chrono::DateTime<chrono::Utc>) -> String {
 /// - **Cost** is the tracker's per-turn delta as is. It is null on a
 ///   session's first turn because Goose's first `usage_update` has no cost.
 /// - **`stop_reason`** is the raw value from the recorder, verbatim.
-/// - **Not built here:** `skill` (D2), `self_assessment` (D3), `delivered`
-///   (D1h). Absent rather than null, since each is optional.
+/// - **`delivered`** from the accepted sends, see [`delivered`].
+/// - **Not built here:** `skill` (D2), `self_assessment` (D3). Absent rather
+///   than null, since each is optional.
 pub(crate) fn build_record(
     ctx: &TurnContext,
     obs: &TurnObservation,
@@ -167,7 +168,7 @@ pub(crate) fn build_record(
         .clone()
         .or_else(|| usage.and_then(|u| u.model.clone()));
 
-    json!({
+    let mut record = json!({
         "harness": HARNESS,
         "harness_version": ctx.harness_version,
         "acp_protocol_version": ctx.acp_protocol_version,
@@ -192,7 +193,31 @@ pub(crate) fn build_record(
             "reasoning": obs.reasoning,
             "tool_results": obs.tool_results,
         },
-    })
+    });
+    if let Some(delivered) = delivered(ctx, obs) {
+        record["delivered"] = delivered;
+    }
+    record
+}
+
+/// `delivered` (API note `03f40ec8`): present when at least one send was
+/// accepted, anywhere. `event_id` is the LAST accepted send in the turn's own
+/// channel, null if none went there. A send elsewhere is a hand-off, not the
+/// reply. `delivered.sends` is planned and NOT accepted yet, so it is not
+/// sent; `artifact_ids` is not sent either, since the harness cannot see
+/// which artifacts a turn produced.
+fn delivered(ctx: &TurnContext, obs: &TurnObservation) -> Option<serde_json::Value> {
+    if obs.sends.is_empty() {
+        return None;
+    }
+    let own = ctx.channel_id.as_deref().map(str::to_ascii_lowercase);
+    let event_id = obs
+        .sends
+        .iter()
+        .rev()
+        .find(|s| own.is_some() && s.channel_id == own)
+        .map(|s| s.event_id.clone());
+    Some(serde_json::json!({ "event_id": event_id }))
 }
 
 /// Serialise a record once. This is the only constructor of
@@ -383,6 +408,46 @@ mod tests {
             "_meta":{"goose":{"inference":{"provider":"anthropic","requestedModel":"claude-sonnet-5"}}}})));
         r.record_stop_reason("end_turn");
         r.take().unwrap()
+    }
+
+    fn send(id: char, channel: Option<&str>) -> crate::turn_record::AcceptedSend {
+        crate::turn_record::AcceptedSend {
+            event_id: id.to_string().repeat(64),
+            channel_id: channel.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn delivered_is_the_last_accepted_send_in_the_turns_own_channel() {
+        let own = "7dfc1946-10d3-4497-8080-94db7575fc70";
+        let other = "1d98c187-8686-4bd6-b88c-ffc4d410471e";
+        let mut obs = observed();
+        obs.sends = vec![
+            send('1', Some(own)),
+            send('2', Some(own)),
+            send('3', Some(other)),
+            send('4', None),
+        ];
+        let v = build_record(&ctx(), &obs, None);
+        assert_eq!(v["delivered"], json!({"event_id": "2".repeat(64)}));
+        assert!(
+            v["delivered"].get("sends").is_none(),
+            "not accepted by ENGRAM yet"
+        );
+    }
+
+    #[test]
+    fn a_turn_that_only_handed_off_delivered_with_a_null_event_id() {
+        let mut obs = observed();
+        obs.sends = vec![send('3', Some("1d98c187-8686-4bd6-b88c-ffc4d410471e"))];
+        let v = build_record(&ctx(), &obs, None);
+        assert_eq!(v["delivered"], json!({"event_id": null}));
+    }
+
+    #[test]
+    fn a_turn_with_no_accepted_send_has_no_delivered() {
+        let v = build_record(&ctx(), &observed(), None);
+        assert!(v.get("delivered").is_none());
     }
 
     #[test]

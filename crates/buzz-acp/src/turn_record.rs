@@ -76,6 +76,20 @@ pub(crate) struct TurnObservation {
     pub tool_results: Vec<String>,
     /// True if any raw field hit [`RAW_FIELD_CAP`] in the harness.
     pub raw_capped: bool,
+    /// Every `buzz messages send` the relay accepted, in completion order
+    /// (D1h). The record's `delivered` is derived from this.
+    pub sends: Vec<AcceptedSend>,
+}
+
+/// One accepted `buzz messages send`, read from the shell call's own command
+/// and output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AcceptedSend {
+    pub event_id: String,
+    /// The `--channel` the command named, lowercased. `None` when it cannot be
+    /// attributed (no `--channel`, or several sends in one call that do not
+    /// pair up): such a send still counts as delivered, never as the reply.
+    pub channel_id: Option<String>,
 }
 
 impl TurnObservation {
@@ -120,6 +134,8 @@ pub(crate) struct TurnRecorder {
 struct InFlight {
     obs: TurnObservation,
     index: HashMap<String, usize>,
+    /// A shell call's `rawInput.command`, when it contains a send.
+    send_commands: HashMap<usize, String>,
 }
 
 fn str_at<'a>(v: &'a serde_json::Value, pointer: &str) -> Option<&'a str> {
@@ -155,6 +171,7 @@ impl TurnRecorder {
                 ..TurnObservation::default()
             },
             index: HashMap::new(),
+            send_commands: HashMap::new(),
         });
     }
 
@@ -235,7 +252,9 @@ impl TurnRecorder {
                         str_at(update, "/_meta/goose/toolCall/extensionName").map(str::to_string);
                 }
 
+                let mut became_terminal = false;
                 if let Some(status) = str_at(update, "/status") {
+                    became_terminal = is_terminal(status) && !call.terminal;
                     if is_terminal(status) {
                         call.status = Some(status.to_string());
                         call.terminal = true;
@@ -263,6 +282,22 @@ impl TurnRecorder {
                         }
                     }
                 }
+
+                // D1h: our agents reply by running `buzz messages send` in a
+                // shell, so the reply's event id is in that call's output.
+                if let Some(command) = str_at(update, "/rawInput/command") {
+                    if command.contains(SEND_VERB) {
+                        cur.send_commands
+                            .entry(idx)
+                            .or_insert_with(|| command.to_string());
+                    }
+                }
+                if became_terminal {
+                    if let Some(command) = cur.send_commands.get(&idx) {
+                        let output = tool_output_text(update).unwrap_or_default();
+                        cur.obs.sends.extend(accepted_sends(command, &output));
+                    }
+                }
             }
             _ => {}
         }
@@ -272,6 +307,95 @@ impl TurnRecorder {
     pub fn take(&mut self) -> Option<TurnObservation> {
         self.current.take().map(|cur| cur.obs)
     }
+}
+
+/// The CLI verb a reply is sent with.
+const SEND_VERB: &str = "buzz messages send";
+
+/// What the shell printed: `rawOutput.stdout` (Goose 1.57.0's shell result is
+/// `{stdout, stderr, exit_code}`), else the joined text content.
+fn tool_output_text(update: &serde_json::Value) -> Option<String> {
+    if let Some(stdout) = update.pointer("/rawOutput/stdout").and_then(|v| v.as_str()) {
+        return Some(stdout.to_string());
+    }
+    if let Some(raw) = update.get("rawOutput").and_then(|v| v.as_str()) {
+        return Some(raw.to_string());
+    }
+    let parts: Vec<&str> = update
+        .get("content")?
+        .as_array()?
+        .iter()
+        .filter_map(|c| {
+            c.pointer("/content/text")
+                .or_else(|| c.pointer("/text"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("\n"))
+}
+
+/// The `--channel` of each send in a command, in order. Accepts
+/// `--channel X`, `--channel=X` and a quoted value; anything that is not a
+/// UUID is `None`, never a guess.
+pub(crate) fn send_channels(command: &str) -> Vec<Option<String>> {
+    let starts: Vec<usize> = command.match_indices(SEND_VERB).map(|(i, _)| i).collect();
+    starts
+        .iter()
+        .enumerate()
+        .map(|(n, &start)| {
+            let end = starts.get(n + 1).copied().unwrap_or(command.len());
+            let segment = &command[start..end];
+            let at = segment.find("--channel")? + "--channel".len();
+            let rest = segment[at..].trim_start_matches([' ', '=', '\t']);
+            let rest = rest.trim_start_matches(['"', '\'']);
+            let candidate = rest.get(..36)?;
+            uuid::Uuid::parse_str(candidate).ok().map(|u| u.to_string())
+        })
+        .collect()
+}
+
+/// The event id of each `{"accepted":true,"event_id":…}` line, in order. A
+/// refused send (`accepted: false`) or a malformed id is not a send.
+pub(crate) fn accepted_event_ids(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with('{'))
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v.get("accepted").and_then(|a| a.as_bool()) == Some(true))
+        .filter_map(|v| {
+            v.get("event_id")
+                .and_then(|e| e.as_str())
+                .map(str::to_string)
+        })
+        .filter(|id| id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(|id| id.to_ascii_lowercase())
+        .collect()
+}
+
+/// Pair a call's sends with its accepted ids. One-to-one when the counts
+/// match; one channel for all when every send named the same one; otherwise
+/// unattributed, because pairing by position would be a guess.
+fn accepted_sends(command: &str, output: &str) -> Vec<AcceptedSend> {
+    let channels = send_channels(command);
+    let ids = accepted_event_ids(output);
+    let shared = channels
+        .first()
+        .cloned()
+        .flatten()
+        .filter(|c| channels.iter().all(|x| x.as_deref() == Some(c.as_str())));
+    let paired = channels.len() == ids.len();
+    ids.into_iter()
+        .enumerate()
+        .map(|(i, event_id)| AcceptedSend {
+            event_id,
+            channel_id: if paired {
+                channels[i].clone()
+            } else {
+                shared.clone()
+            },
+        })
+        .collect()
 }
 
 /// The text of a terminal tool update: `rawOutput` if present (it carries
@@ -297,6 +421,145 @@ fn tool_result_text(update: &serde_json::Value) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ── D1h: accepted sends ──────────────────────────────────────────────
+
+    const OWN: &str = "7dfc1946-10d3-4497-8080-94db7575fc70";
+    const OTHER: &str = "1d98c187-8686-4bd6-b88c-ffc4d410471e";
+
+    fn hex(c: char) -> String {
+        c.to_string().repeat(64)
+    }
+
+    /// A `shell` call as Goose 1.57.0 sends it: `tool_call` with `rawInput`,
+    /// an `in_progress` update, then `completed` with
+    /// `rawOutput {stdout, stderr, exit_code}` (v8 review §1.4).
+    fn run_shell(r: &mut TurnRecorder, id: &str, command: &str, stdout: &str) {
+        r.observe(&update(
+            "s",
+            json!({"sessionUpdate":"tool_call","toolCallId":id,
+            "title":"Run","kind":"execute","status":"pending","rawInput":{"command":command},
+            "_meta":{"goose":{"toolCall":{"toolName":"shell","extensionName":"developer"}}}}),
+        ));
+        r.observe(&update(
+            "s",
+            json!({"sessionUpdate":"tool_call_update","toolCallId":id,
+            "status":"in_progress"}),
+        ));
+        r.observe(&update(
+            "s",
+            json!({"sessionUpdate":"tool_call_update","toolCallId":id,
+            "status":"completed","rawOutput":{"stdout":stdout,"stderr":"","exit_code":0}}),
+        ));
+    }
+
+    fn accepted(id: &str) -> String {
+        format!(r#"{{"accepted":true,"event_id":"{id}","mention_pubkeys":[],"message":""}}"#)
+    }
+
+    #[test]
+    fn a_turn_with_several_sends_records_each_with_its_channel_in_order() {
+        let mut r = TurnRecorder::default();
+        r.begin_turn("s");
+        // The measured shape (DEV coder, event 6313597d…): a thread reply.
+        run_shell(
+            &mut r,
+            "a",
+            &format!(
+                "buzz messages send --channel {OWN} --reply-to {} --content \"first\"",
+                hex('c')
+            ),
+            &accepted(&hex('1')),
+        );
+        run_shell(
+            &mut r,
+            "b",
+            &format!("buzz messages send --channel={OTHER} --content 'hand-off'"),
+            &accepted(&hex('2')),
+        );
+        run_shell(
+            &mut r,
+            "c",
+            &format!("cd /tmp && buzz messages send --channel \"{OWN}\" --content x"),
+            &accepted(&hex('3')),
+        );
+        // Refused by the relay: not a send.
+        run_shell(
+            &mut r,
+            "d",
+            &format!("buzz messages send --channel {OWN} --content y"),
+            r#"{"accepted":false,"event_id":null,"message":"rate limited"}"#,
+        );
+        // Not a send at all, though its output looks like one.
+        run_shell(&mut r, "e", "cat /tmp/last-send.json", &accepted(&hex('4')));
+        let obs = r.take().unwrap();
+        let got: Vec<(String, Option<String>)> = obs
+            .sends
+            .iter()
+            .map(|s| (s.event_id.clone(), s.channel_id.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (hex('1'), Some(OWN.into())),
+                (hex('2'), Some(OTHER.into())),
+                (hex('3'), Some(OWN.into())),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_repeated_terminal_update_does_not_count_a_send_twice() {
+        let mut r = TurnRecorder::default();
+        r.begin_turn("s");
+        let cmd = format!("buzz messages send --channel {OWN} --content x");
+        run_shell(&mut r, "a", &cmd, &accepted(&hex('1')));
+        r.observe(&update("s", json!({"sessionUpdate":"tool_call_update","toolCallId":"a",
+            "status":"completed","rawOutput":{"stdout":accepted(&hex('1')),"stderr":"","exit_code":0}})));
+        assert_eq!(r.take().unwrap().sends.len(), 1);
+    }
+
+    #[test]
+    fn two_sends_in_one_call_pair_by_position_only_when_the_counts_match() {
+        let two = format!(
+            "buzz messages send --channel {OWN} --content a && buzz messages send --channel {OTHER} --content b");
+        let out = format!("{}\n{}\n", accepted(&hex('1')), accepted(&hex('2')));
+        let s = accepted_sends(&two, &out);
+        assert_eq!(s[0].channel_id.as_deref(), Some(OWN));
+        assert_eq!(s[1].channel_id.as_deref(), Some(OTHER));
+        // One of the two was refused: positions no longer line up, and the
+        // channels differ, so neither is attributed rather than guessed.
+        let s = accepted_sends(&two, &accepted(&hex('2')));
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].channel_id, None);
+        // Same count mismatch, but both named one channel: that one.
+        let same = format!(
+            "buzz messages send --channel {OWN} --content a; buzz messages send --channel {OWN} --content b");
+        assert_eq!(
+            accepted_sends(&same, &accepted(&hex('2')))[0]
+                .channel_id
+                .as_deref(),
+            Some(OWN)
+        );
+    }
+
+    #[test]
+    fn send_channels_refuses_anything_that_is_not_a_uuid() {
+        assert_eq!(send_channels("buzz messages send --content x"), vec![None]);
+        assert_eq!(
+            send_channels("buzz messages send --channel $CHANNEL --content x"),
+            vec![None]
+        );
+        assert_eq!(
+            send_channels(&format!(
+                "buzz messages send --channel {}",
+                OWN.to_uppercase()
+            )),
+            vec![Some(OWN.to_string())],
+            "lowercased, so it compares with the turn's channel"
+        );
+        assert!(send_channels("echo hi").is_empty());
+    }
 
     #[test]
     fn turn_seq_counts_per_session_and_survives_an_untaken_turn() {

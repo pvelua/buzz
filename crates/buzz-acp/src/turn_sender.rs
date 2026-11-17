@@ -4,7 +4,7 @@
 //! built and serialised once by [`crate::turn_payload`]; this module only
 //! moves those bytes, and never rebuilds them.
 //!
-//! Contract: API note KB `97f63175` ("Transport", "Idempotency",
+//! Contract: API note KB `03f40ec8` ("Transport", "Idempotency",
 //! "Responses"). The response table, as implemented:
 //!
 //! | response | here |
