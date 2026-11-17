@@ -239,6 +239,12 @@ pub struct AcpClient {
     goose_usage: UsageTracker,
     /// Per-turn prompt-response usage and Claude's optional cumulative cost.
     standard_usage: StandardUsageTracker,
+    /// Per-turn capture for ENGRAM's turn record (Track D1a).
+    turn_record: crate::turn_record::TurnRecorder,
+    /// `protocolVersion` from the `initialize` response, for the turn record.
+    acp_protocol_version: Option<u64>,
+    /// `agentInfo.version` from the `initialize` response (Goose's version).
+    agent_version: Option<String>,
     /// Known adapter identity for prompt-response usage mapping.
     standard_adapter: Option<StandardAdapterKind>,
 }
@@ -637,6 +643,9 @@ impl AcpClient {
             steer_rx: None,
             goose_usage: UsageTracker::default(),
             standard_usage: StandardUsageTracker::default(),
+            turn_record: crate::turn_record::TurnRecorder::default(),
+            acp_protocol_version: None,
+            agent_version: None,
             standard_adapter,
         })
     }
@@ -692,6 +701,11 @@ impl AcpClient {
             .pointer("/_meta/steering/supported")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        self.acp_protocol_version = result.get("protocolVersion").and_then(|v| v.as_u64());
+        self.agent_version = result
+            .pointer("/agentInfo/version")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
         tracing::debug!(target: "acp::init", "initialize response: {result}");
         Ok(result)
     }
@@ -870,6 +884,7 @@ impl AcpClient {
         // misattributed to this turn.
         self.goose_usage.begin_turn(session_id);
         self.standard_usage.begin_turn(session_id);
+        self.turn_record.begin_turn(session_id);
 
         self.last_prompt_id = Some(self.next_id);
         let id = self.next_id;
@@ -964,6 +979,18 @@ impl AcpClient {
     /// Consume per-turn usage for NIP-AM publishing. Goose/buzz-agent is an
     /// exclusive cumulative path; standard ACP prompt usage is used only when
     /// goose emitted nothing for this turn.
+    /// Consume what the turn recorder captured for ENGRAM's turn record.
+    #[allow(dead_code)] // read by the sender's wiring, D1e
+    pub(crate) fn take_turn_record(&mut self) -> Option<crate::turn_record::TurnObservation> {
+        self.turn_record.take()
+    }
+
+    /// `protocolVersion` and Goose's `agentInfo.version` from `initialize`.
+    #[allow(dead_code)] // read by the record builder, D1b
+    pub(crate) fn agent_handshake(&self) -> (Option<u64>, Option<&str>) {
+        (self.acp_protocol_version, self.agent_version.as_deref())
+    }
+
     pub fn take_turn_usage(&mut self) -> Option<TurnUsage> {
         let goose_usage = self.goose_usage.take();
         let standard_usage = self.standard_usage.take();
@@ -1826,6 +1853,7 @@ impl AcpClient {
     /// leave it `None` and are steered via `_session/steering` instead, which
     /// needs no run id.
     fn handle_session_update(&mut self, msg: &serde_json::Value) -> bool {
+        self.turn_record.observe(msg);
         let update = &msg["params"]["update"];
         let update_type = update
             .get("sessionUpdate")
@@ -2095,6 +2123,9 @@ impl AcpClient {
         result: &serde_json::Value,
     ) -> Result<StopReason, AcpError> {
         let stop_reason = self.parse_stop_reason(result)?;
+        if let Some(raw) = result["stopReason"].as_str() {
+            self.turn_record.record_stop_reason(raw);
+        }
         if let Some(adapter) = self.standard_adapter {
             match serde_json::from_value::<PromptResponseUsage>(result["usage"].clone()) {
                 Ok(usage) => self
@@ -4580,6 +4611,37 @@ mod tests {
         assert_eq!(usage.cumulative_cost_usd, Some(0.5));
         drop(client);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn client_feeds_the_turn_recorder_from_updates_and_the_prompt_response() {
+        // D1a wiring: the recorder sees what handle_session_update sees, and the
+        // raw stopReason verbatim from the prompt response (not case-folded).
+        let mut client = spawn_inert_client().await;
+        client.turn_record.begin_turn("rec-session");
+        client.handle_session_update(&serde_json::json!({
+            "jsonrpc": "2.0", "method": "session/update",
+            "params": {"sessionId": "rec-session", "update": {
+                "sessionUpdate": "tool_call", "toolCallId": "t1", "status": "pending",
+                "_meta": {"goose": {"toolCall": {"toolName": "shell", "extensionName": "developer"}}}
+            }}
+        }));
+        client.handle_session_update(&serde_json::json!({
+            "jsonrpc": "2.0", "method": "session/update",
+            "params": {"sessionId": "rec-session", "update": {
+                "sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": "failed"
+            }}
+        }));
+        client
+            .parse_prompt_response(
+                "rec-session",
+                &serde_json::json!({"stopReason": "End_Turn"}),
+            )
+            .unwrap();
+        let obs = client.take_turn_record().expect("a turn was recorded");
+        assert_eq!(obs.tool_calls.len(), 1);
+        assert_eq!(obs.tool_calls[0].status.as_deref(), Some("failed"));
+        assert_eq!(obs.stop_reason.as_deref(), Some("End_Turn"));
     }
 
     #[tokio::test]
