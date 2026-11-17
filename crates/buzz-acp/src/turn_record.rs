@@ -56,6 +56,11 @@ pub(crate) struct ToolAggregate {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct TurnObservation {
     pub session_id: String,
+    /// The harness's own per-session counter, from 1. Exists even when Goose
+    /// reports no usage, so it is not the usage tracker's `turn_seq`.
+    pub turn_seq: u64,
+    /// When `session/prompt` was about to be sent.
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
     /// In order of first sight of each `toolCallId`.
     pub tool_calls: Vec<ToolCall>,
     /// What `load_skill` was asked for, verbatim and de-duplicated, in order.
@@ -106,6 +111,9 @@ impl TurnObservation {
 #[derive(Debug, Default)]
 pub(crate) struct TurnRecorder {
     current: Option<InFlight>,
+    /// Last `turn_seq` handed out, per session id. A process restart starts
+    /// again at 1; ENGRAM's key carries `trigger_event_id` for that reason.
+    seqs: HashMap<String, u64>,
 }
 
 #[derive(Debug, Default)]
@@ -136,9 +144,14 @@ fn push_capped(buf: &mut String, text: &str, capped: &mut bool) {
 impl TurnRecorder {
     /// Start a turn. Discards anything left from a turn never taken.
     pub fn begin_turn(&mut self, session_id: &str) {
+        let seq = self.seqs.entry(session_id.to_string()).or_insert(0);
+        *seq += 1;
+        let turn_seq = *seq;
         self.current = Some(InFlight {
             obs: TurnObservation {
                 session_id: session_id.to_string(),
+                turn_seq,
+                started_at: Some(chrono::Utc::now()),
                 ..TurnObservation::default()
             },
             index: HashMap::new(),
@@ -284,6 +297,26 @@ fn tool_result_text(update: &serde_json::Value) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn turn_seq_counts_per_session_and_survives_an_untaken_turn() {
+        let mut r = TurnRecorder::default();
+        r.begin_turn("a");
+        assert_eq!(r.take().unwrap().turn_seq, 1);
+        r.begin_turn("a");
+        // Never taken: the next begin discards it, but the number is spent,
+        // so a seq is never reused for two different turns.
+        r.begin_turn("a");
+        let third = r.take().unwrap();
+        assert_eq!(third.turn_seq, 3);
+        assert!(third.started_at.is_some());
+        r.begin_turn("b");
+        assert_eq!(
+            r.take().unwrap().turn_seq,
+            1,
+            "another session counts on its own"
+        );
+    }
 
     fn update(session: &str, update: serde_json::Value) -> serde_json::Value {
         json!({"jsonrpc":"2.0","method":"session/update",

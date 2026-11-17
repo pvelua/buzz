@@ -229,9 +229,63 @@ impl TurnSender {
         }
     }
 
-    /// True once ENGRAM has answered `[observation_disabled]`.
+    /// True once ENGRAM has answered `[observation_disabled]`. Test-only:
+    /// `submit` reads the flag itself, so nothing else needs to.
+    #[cfg(test)]
     pub fn is_disabled(&self) -> bool {
         self.disabled.load(Ordering::Relaxed)
+    }
+}
+
+/// What a finished turn needs to become a record, built once at startup and
+/// shared by every prompt task through `PromptContext`.
+#[derive(Clone)]
+pub(crate) struct Observation {
+    pub sender: TurnSender,
+    pub project: String,
+    /// The harness build, the `+buzz.<build>` half of `harness_version`.
+    /// From `BUZZ_BUILD`, which the image bakes in (D1f); `None` is written
+    /// `unknown`, never guessed.
+    pub build: Option<String>,
+}
+
+impl Observation {
+    /// `None` when `ENGRAM_OBSERVE` is off (silently) or the configuration is
+    /// incomplete (one ERROR line naming what is missing). Either way the agent
+    /// starts: observation must never stop an agent answering. Must be called
+    /// inside a Tokio runtime.
+    pub fn start() -> Option<Self> {
+        let config = match ObservationConfig::from_env() {
+            Ok(None) => return None,
+            Ok(Some(config)) => config,
+            Err(e) => {
+                tracing::error!(target: "turn_record::send", "turn observation: NOT started: {e}");
+                return None;
+            }
+        };
+        let project = config.project.clone();
+        let endpoint = config.endpoint.clone();
+        let sender = match TurnSender::spawn(config) {
+            Ok(sender) => sender,
+            Err(e) => {
+                tracing::error!(target: "turn_record::send", "turn observation: NOT started: {e}");
+                return None;
+            }
+        };
+        let build = std::env::var("BUZZ_BUILD")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        tracing::info!(
+            target: "turn_record::send",
+            "turn observation: enabled, endpoint={endpoint} project={project} build={}",
+            build.as_deref().unwrap_or("unknown")
+        );
+        Some(Self {
+            sender,
+            project,
+            build,
+        })
     }
 }
 

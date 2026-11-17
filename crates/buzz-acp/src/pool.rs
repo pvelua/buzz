@@ -859,6 +859,10 @@ pub struct PromptContext {
     /// the desktop keys per (agent, relay) pair, e.g. `session_config_captured`,
     /// mirroring the `managed_agent_runtime_lifecycle` frames.
     pub relay_url: String,
+    /// ENGRAM's per-turn record (Buzz v1.4.0 Track D). `None` unless
+    /// `ENGRAM_OBSERVE` is on and complete; then every turn that sent
+    /// `session/prompt` produces one record.
+    pub observation: Option<crate::turn_sender::Observation>,
 }
 
 impl AgentPool {
@@ -2391,6 +2395,8 @@ pub async fn run_prompt_task(
         .as_ref()
         .map(|b| b.events.iter().map(|be| be.event.id.to_hex()).collect())
         .unwrap_or_default();
+    // Read now: the batch is moved into a requeue on some exit paths.
+    let turn_facts = turn_facts_for(batch.as_ref(), observer_channel_id);
     agent.acp.observe(
         "turn_started",
         serde_json::json!({
@@ -2819,10 +2825,10 @@ pub async fn run_prompt_task(
                             .state
                             .mark_scope_delivery_success(scope.clone(), true, [], []);
                     }
-                    let usage = agent.acp.take_turn_usage();
-                    publish_agent_turn_metric(
+                    finish_turn(
                         &ctx,
-                        usage,
+                        &mut agent,
+                        &turn_facts,
                         Some(*cid),
                         &session_id,
                         &format!("{turn_id}:initial"),
@@ -2854,10 +2860,10 @@ pub async fn run_prompt_task(
                         .await
                     {
                         Ok(stop_reason) => {
-                            let usage = agent.acp.take_turn_usage();
-                            publish_agent_turn_metric(
+                            finish_turn(
                                 &ctx,
-                                usage,
+                                &mut agent,
+                                &turn_facts,
                                 Some(*cid),
                                 &session_id,
                                 &format!("{turn_id}:initial"),
@@ -3199,10 +3205,10 @@ pub async fn run_prompt_task(
                                 let retry_batch =
                                     requeue_cancelled_batch(&ctx, control_signal, batch);
 
-                                let usage = agent.acp.take_turn_usage();
-                                publish_agent_turn_metric(
+                                finish_turn(
                                     &ctx,
-                                    usage,
+                                    &mut agent,
+                                    &turn_facts,
                                     observer_channel_id,
                                     &session_id,
                                     &turn_id,
@@ -3235,10 +3241,10 @@ pub async fn run_prompt_task(
                                     agent.state.invalidate(&source);
                                 }
 
-                                let usage = agent.acp.take_turn_usage();
-                                publish_agent_turn_metric(
+                                finish_turn(
                                     &ctx,
-                                    usage,
+                                    &mut agent,
+                                    &turn_facts,
                                     observer_channel_id,
                                     &session_id,
                                     &turn_id,
@@ -3301,10 +3307,10 @@ pub async fn run_prompt_task(
                             &source,
                             &control_signal,
                         );
-                        let usage = agent.acp.take_turn_usage();
-                        publish_agent_turn_metric(
+                        finish_turn(
                             &ctx,
-                            usage,
+                            &mut agent,
+                            &turn_facts,
                             observer_channel_id,
                             &session_id,
                             &turn_id,
@@ -3376,10 +3382,10 @@ pub async fn run_prompt_task(
             }
 
             let core_stop = acp_stop_to_core(&stop_reason);
-            let usage = agent.acp.take_turn_usage();
-            publish_agent_turn_metric(
+            finish_turn(
                 &ctx,
-                usage,
+                &mut agent,
+                &turn_facts,
                 observer_channel_id,
                 &session_id,
                 &turn_id,
@@ -3399,10 +3405,10 @@ pub async fn run_prompt_task(
         Err(AcpError::AgentExited) => {
             tracing::error!(target: "pool::prompt", "agent {} exited during prompt", agent.index);
             agent.state.invalidate_all();
-            let usage = agent.acp.take_turn_usage();
-            publish_agent_turn_metric(
+            finish_turn(
                 &ctx,
-                usage,
+                &mut agent,
+                &turn_facts,
                 observer_channel_id,
                 &session_id,
                 &turn_id,
@@ -3431,10 +3437,10 @@ pub async fn run_prompt_task(
             {
                 Ok(stop_reason) => {
                     log_stop_reason(&source, &stop_reason);
-                    let usage = agent.acp.take_turn_usage();
-                    publish_agent_turn_metric(
+                    finish_turn(
                         &ctx,
-                        usage,
+                        &mut agent,
+                        &turn_facts,
                         observer_channel_id,
                         &session_id,
                         &turn_id,
@@ -3459,10 +3465,10 @@ pub async fn run_prompt_task(
                         agent.index
                     );
                     agent.state.invalidate_all();
-                    let usage = agent.acp.take_turn_usage();
-                    publish_agent_turn_metric(
+                    finish_turn(
                         &ctx,
-                        usage,
+                        &mut agent,
+                        &turn_facts,
                         observer_channel_id,
                         &session_id,
                         &turn_id,
@@ -3484,10 +3490,10 @@ pub async fn run_prompt_task(
                         "cancel_with_cleanup error: {e} — invalidating session"
                     );
                     agent.state.invalidate(&source);
-                    let usage = agent.acp.take_turn_usage();
-                    publish_agent_turn_metric(
+                    finish_turn(
                         &ctx,
-                        usage,
+                        &mut agent,
+                        &turn_facts,
                         observer_channel_id,
                         &session_id,
                         &turn_id,
@@ -3513,10 +3519,10 @@ pub async fn run_prompt_task(
                 ctx.max_turn_duration.as_secs()
             );
             agent.state.invalidate_all();
-            let usage = agent.acp.take_turn_usage();
-            publish_agent_turn_metric(
+            finish_turn(
                 &ctx,
-                usage,
+                &mut agent,
+                &turn_facts,
                 observer_channel_id,
                 &session_id,
                 &turn_id,
@@ -3540,10 +3546,10 @@ pub async fn run_prompt_task(
             if !matches!(e, AcpError::AgentError { .. }) {
                 agent.state.invalidate(&source);
             }
-            let usage = agent.acp.take_turn_usage();
-            publish_agent_turn_metric(
+            finish_turn(
                 &ctx,
-                usage,
+                &mut agent,
+                &turn_facts,
                 observer_channel_id,
                 &session_id,
                 &turn_id,
@@ -5276,6 +5282,76 @@ pub(crate) fn build_turn_metric_counts(
         cache_write_tokens: usage.cumulative_cache_write_tokens,
     });
     (turn_counts, cumulative_counts)
+}
+
+/// The record's batch half: the trigger is the newest event (the one that
+/// woke the turn), and the episode is its thread root, or the trigger itself
+/// when it is top-level (it opens the thread, as `SessionScope::derive` says).
+fn turn_facts_for(
+    batch: Option<&FlushBatch>,
+    channel_id: Option<Uuid>,
+) -> crate::turn_payload::TurnFacts {
+    let last = batch.and_then(|b| b.events.last());
+    let trigger_event_id = last.map(|be| be.event.id.to_hex());
+    let episode_ref = batch
+        .and_then(|b| b.scope.root_event_id().map(str::to_string))
+        .or_else(|| {
+            last.and_then(|be| crate::queue::parse_thread_tags(&be.event).root_event_id)
+                .map(|r| r.to_ascii_lowercase())
+        })
+        .or_else(|| trigger_event_id.clone());
+    crate::turn_payload::TurnFacts {
+        trigger_event_id,
+        episode_ref,
+        channel_id: channel_id.map(|c| c.to_string()),
+    }
+}
+
+/// Every end of a turn that sent `session/prompt`: takes the usage ONCE and
+/// feeds both the `kind:44200` metric and ENGRAM's turn record, so the two can
+/// never disagree about which turn's counters they carry. The record is queued
+/// and never awaited: observation must not delay or fail a turn.
+#[allow(clippy::too_many_arguments)]
+async fn finish_turn(
+    ctx: &PromptContext,
+    agent: &mut OwnedAgent,
+    facts: &crate::turn_payload::TurnFacts,
+    channel_id: Option<uuid::Uuid>,
+    session_id: &str,
+    turn_id: &str,
+    stop_reason: Option<buzz_core::agent_turn_metric::StopReason>,
+) {
+    let usage = agent.acp.take_turn_usage();
+    let observed = agent.acp.take_turn_record();
+    if let (Some(observation), Some(obs)) = (ctx.observation.as_ref(), observed) {
+        let (acp_protocol_version, agent_version) = agent.acp.agent_handshake();
+        let failed = matches!(
+            stop_reason,
+            Some(buzz_core::agent_turn_metric::StopReason::Error)
+        );
+        let degraded = matches!(
+            crate::engram_skill::trouble(),
+            Some(crate::engram_skill::SkillTrouble::Degraded { .. })
+        );
+        let outcome =
+            crate::turn_payload::turn_outcome(obs.stop_reason.as_deref(), failed, degraded);
+        let harness = crate::turn_payload::HarnessFacts {
+            project: &observation.project,
+            build: observation.build.as_deref(),
+            acp_protocol_version,
+            agent_version,
+        };
+        let bytes = crate::turn_payload::record_for_turn(
+            &harness,
+            facts,
+            &obs,
+            usage.as_ref(),
+            outcome,
+            chrono::Utc::now(),
+        );
+        observation.sender.submit(bytes);
+    }
+    publish_agent_turn_metric(ctx, usage, channel_id, session_id, turn_id, stop_reason).await;
 }
 
 /// Best-effort: build and publish a `kind:44200` NIP-AM agent turn metric event.
@@ -8236,6 +8312,218 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         );
     }
 
+    // ── Track D1e: the turn record's batch half ──────────────────────────
+
+    /// D1e end to end: one channel turn against a mock ACP agent posts exactly
+    /// one record to ENGRAM, carrying the batch's trigger and the session's
+    /// seq. A ctx without `observation` posts nothing (the negative arm).
+    #[tokio::test]
+    async fn a_finished_turn_posts_one_turn_record_and_none_when_observation_is_off() {
+        use axum::{body::Bytes, routing::post, Router};
+
+        let bodies: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let engram = format!("http://{}", listener.local_addr().unwrap());
+        let captured = bodies.clone();
+        let app = Router::new().route(
+            "/api/agent-turns",
+            post(move |body: Bytes| {
+                let captured = captured.clone();
+                async move {
+                    captured.lock().unwrap().push(body.to_vec());
+                    r#"{"outcome":"stored","turn_key":"k"}"#
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let run_one = |observation: Option<crate::turn_sender::Observation>| async move {
+            let script = r#"count=0
+while IFS= read -r line; do
+  printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$count,\"result\":{\"stopReason\":\"end_turn\"}}"
+  count=$((count + 1))
+done"#;
+            let acp = AcpClient::spawn("bash", &["-c".into(), script.into()], &[], false)
+                .await
+                .expect("spawn mock ACP");
+            let channel_id = Uuid::new_v4();
+            let scope = conv(channel_id);
+            let mut agent = OwnedAgent {
+                index: 0,
+                acp,
+                state: SessionState::default(),
+                model_capabilities: None,
+                desired_model: None,
+                model_overridden: false,
+                desired_model_request_id: None,
+                desired_model_pending_ack: false,
+                startup_effort: None,
+                agent_name: "observed-agent".into(),
+                goose_system_prompt_supported: None,
+                protocol_version: 1,
+            };
+            agent
+                .state
+                .sessions
+                .insert(scope.clone(), "observed-session".into());
+            agent
+                .state
+                .deliveries
+                .insert(scope.clone(), ChannelDeliveryState::default());
+            let event = EventBuilder::new(Kind::Custom(9), "@agent hello")
+                .sign_with_keys(&Keys::generate())
+                .unwrap();
+            let trigger = event.id.to_hex();
+            let batch = FlushBatch {
+                channel_id,
+                scope,
+                events: vec![crate::queue::BatchEvent {
+                    event,
+                    prompt_tag: "@mention".into(),
+                    received_at: std::time::Instant::now(),
+                }],
+                cancelled_events: vec![],
+                cancel_reason: None,
+            };
+            let mut ctx = make_prompt_context_no_owner();
+            ctx.context_message_limit = 0;
+            ctx.channel_info = ChannelInfoResolver::new(
+                HashMap::from([(
+                    channel_id,
+                    crate::relay::ChannelInfo {
+                        name: "observed".into(),
+                        channel_type: "stream".into(),
+                        description: None,
+                    },
+                )]),
+                ctx.rest_client.clone(),
+            );
+            ctx.channel_info.projects.write().unwrap().insert(
+                channel_id,
+                CachedProjectInfo {
+                    fetched_at: std::time::Instant::now(),
+                    value: None,
+                },
+            );
+            ctx.observation = observation;
+            let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+            run_prompt_task(
+                agent,
+                Some(batch),
+                None,
+                Arc::new(ctx),
+                result_tx,
+                None,
+                "observed-turn".into(),
+            )
+            .await;
+            let mut result = result_rx.recv().await.expect("prompt result");
+            assert!(matches!(
+                result.outcome,
+                PromptOutcome::Ok(StopReason::EndTurn)
+            ));
+            result.agent.acp.shutdown().await;
+            (trigger, channel_id)
+        };
+
+        // Negative arm first: observation off sends nothing.
+        run_one(None).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            bodies.lock().unwrap().is_empty(),
+            "observation off must post nothing"
+        );
+
+        let env = HashMap::from([
+            ("ENGRAM_OBSERVE", "1".to_string()),
+            ("ENGRAM_API_URL", engram.clone()),
+            ("ENGRAM_PAT", "engram_pat_test".to_string()),
+            ("ENGRAM_PROJECT", "project:b5cb944650f21b76".to_string()),
+        ]);
+        let config = crate::turn_sender::ObservationConfig::from_lookup(|k| env.get(k).cloned())
+            .unwrap()
+            .unwrap();
+        let observation = crate::turn_sender::Observation {
+            sender: crate::turn_sender::TurnSender::spawn(config).unwrap(),
+            project: "project:b5cb944650f21b76".into(),
+            build: Some("1.4.0".into()),
+        };
+        let (trigger, channel_id) = run_one(Some(observation)).await;
+        for _ in 0..200 {
+            if !bodies.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        server.abort();
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 1, "exactly one record per turn");
+        let v: serde_json::Value = serde_json::from_slice(&bodies[0]).unwrap();
+        assert_eq!(v["harness"], "buzz-acp");
+        assert_eq!(v["session_id"], "observed-session");
+        assert_eq!(v["turn_seq"], 1);
+        assert_eq!(v["trigger_event_id"], trigger);
+        assert_eq!(
+            v["episode_ref"], trigger,
+            "a top-level trigger is its own episode"
+        );
+        assert_eq!(v["channel_id"], channel_id.to_string());
+        assert_eq!(v["project_id"], "project:b5cb944650f21b76");
+        assert_eq!(v["outcome"], "answered");
+        assert_eq!(v["stop_reason"], "end_turn");
+        // The mock never answered `initialize`, so Goose's half is unknown.
+        assert_eq!(v["harness_version"], "unknown+buzz.1.4.0");
+    }
+
+    #[test]
+    fn turn_facts_take_the_episode_from_a_thread_scope() {
+        let ch = Uuid::new_v4();
+        let root = "a".repeat(64);
+        let ev = signed_event_with_tags(vec![]);
+        let trigger = ev.id.to_hex();
+        let facts = turn_facts_for(
+            Some(&batch_with_scope(thread_scope(ch, &root), ev)),
+            Some(ch),
+        );
+        assert_eq!(facts.trigger_event_id.as_deref(), Some(trigger.as_str()));
+        assert_eq!(facts.episode_ref.as_deref(), Some(root.as_str()));
+        assert_eq!(facts.channel_id, Some(ch.to_string()));
+    }
+
+    #[test]
+    fn turn_facts_read_a_replys_root_under_a_channel_scope() {
+        // Our agents run `session_policy=channel`, so the scope has no root
+        // and the episode must come from the reply's own NIP-10 tags.
+        let ch = Uuid::new_v4();
+        let root = "B".repeat(64);
+        let ev = signed_event_with_tags(vec![
+            vec!["e".into(), root.clone(), String::new(), "root".into()],
+            vec!["e".into(), "c".repeat(64), String::new(), "reply".into()],
+        ]);
+        let batch = batch_with_scope(SessionScope::Conversation { channel_id: ch }, ev);
+        let facts = turn_facts_for(Some(&batch), Some(ch));
+        assert_eq!(facts.episode_ref, Some(root.to_ascii_lowercase()));
+    }
+
+    #[test]
+    fn turn_facts_make_a_top_level_trigger_its_own_episode() {
+        let ch = Uuid::new_v4();
+        let ev = signed_event_with_tags(vec![]);
+        let trigger = ev.id.to_hex();
+        let batch = batch_with_scope(SessionScope::Conversation { channel_id: ch }, ev);
+        let facts = turn_facts_for(Some(&batch), Some(ch));
+        assert_eq!(facts.episode_ref.as_deref(), Some(trigger.as_str()));
+    }
+
+    #[test]
+    fn turn_facts_for_a_heartbeat_are_empty() {
+        // No trigger: ENGRAM keys the turn on `started_at` instead.
+        assert_eq!(
+            turn_facts_for(None, None),
+            crate::turn_payload::TurnFacts::default()
+        );
+    }
+
     #[test]
     fn context_target_new_top_level_thread_has_no_history() {
         // A top-level mention opens a thread rooted at its own id; on the first
@@ -10071,6 +10359,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             memory_enabled: false,
             harness_name: "goose".to_string(),
             relay_url: "ws://127.0.0.1:3000".to_string(),
+            observation: None,
         }
     }
 

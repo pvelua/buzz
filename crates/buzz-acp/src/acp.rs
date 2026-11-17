@@ -976,21 +976,19 @@ impl AcpClient {
         self.steering_supported
     }
 
-    /// Consume per-turn usage for NIP-AM publishing. Goose/buzz-agent is an
-    /// exclusive cumulative path; standard ACP prompt usage is used only when
-    /// goose emitted nothing for this turn.
     /// Consume what the turn recorder captured for ENGRAM's turn record.
-    #[allow(dead_code)] // read by the sender's wiring, D1e
     pub(crate) fn take_turn_record(&mut self) -> Option<crate::turn_record::TurnObservation> {
         self.turn_record.take()
     }
 
     /// `protocolVersion` and Goose's `agentInfo.version` from `initialize`.
-    #[allow(dead_code)] // read by the record builder, D1b
     pub(crate) fn agent_handshake(&self) -> (Option<u64>, Option<&str>) {
         (self.acp_protocol_version, self.agent_version.as_deref())
     }
 
+    /// Consume per-turn usage for NIP-AM publishing. Goose/buzz-agent is an
+    /// exclusive cumulative path; standard ACP prompt usage is used only when
+    /// goose emitted nothing for this turn.
     pub fn take_turn_usage(&mut self) -> Option<TurnUsage> {
         let goose_usage = self.goose_usage.take();
         let standard_usage = self.standard_usage.take();

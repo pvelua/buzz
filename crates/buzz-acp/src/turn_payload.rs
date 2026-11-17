@@ -44,6 +44,34 @@ impl TurnOutcome {
     }
 }
 
+/// ENGRAM's mapping (API note `97f63175`), in precedence order:
+///
+/// 1. `failed` (the turn ended in a protocol or process failure) → `error`;
+/// 2. ACP `refusal` → `refused`;
+/// 3. the skill is degraded (`unreadable_parts`, or no skill), or the stop is
+///    `max_tokens` / `max_turn_requests` → `degraded`;
+/// 4. anything else, `end_turn`, `cancelled` and unknown values included →
+///    `answered`.
+///
+/// ⚠️ Our own `require_assigned_skill` refusal never reaches this: it drops
+/// the event before a turn exists (`lib.rs`, item 5), so there is no session
+/// and no record. ENGRAM's `refused` for it is unreachable from a turn.
+pub(crate) fn turn_outcome(
+    stop_raw: Option<&str>,
+    failed: bool,
+    skill_degraded: bool,
+) -> TurnOutcome {
+    if failed {
+        return TurnOutcome::Error;
+    }
+    match stop_raw {
+        Some("refusal") => TurnOutcome::Refused,
+        Some("max_tokens" | "max_turn_requests") => TurnOutcome::Degraded,
+        _ if skill_degraded => TurnOutcome::Degraded,
+        _ => TurnOutcome::Answered,
+    }
+}
+
 /// What only the caller knows about a turn.
 #[derive(Debug, Clone)]
 pub(crate) struct TurnContext {
@@ -174,11 +202,120 @@ pub(crate) fn serialize_record(record: &serde_json::Value) -> TurnRecordBytes {
     TurnRecordBytes(serde_json::to_vec(record).expect("a serde_json::Value always serialises"))
 }
 
+/// What the record needs from the batch, read before the batch is consumed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct TurnFacts {
+    pub trigger_event_id: Option<String>,
+    pub episode_ref: Option<String>,
+    pub channel_id: Option<String>,
+}
+
+/// What the harness knows about itself for this record.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HarnessFacts<'a> {
+    pub project: &'a str,
+    pub build: Option<&'a str>,
+    pub acp_protocol_version: Option<u64>,
+    /// Goose's `agentInfo.version` from `initialize`.
+    pub agent_version: Option<&'a str>,
+}
+
+/// One turn's record, serialised once. The single call site is the pool's
+/// end-of-turn helper; the bytes go straight to the sender.
+pub(crate) fn record_for_turn(
+    harness: &HarnessFacts<'_>,
+    facts: &TurnFacts,
+    obs: &TurnObservation,
+    usage: Option<&TurnUsage>,
+    outcome: TurnOutcome,
+    ended_at: chrono::DateTime<chrono::Utc>,
+) -> TurnRecordBytes {
+    let ctx = TurnContext {
+        harness_version: harness_version(harness.agent_version, harness.build),
+        acp_protocol_version: harness.acp_protocol_version,
+        session_id: obs.session_id.clone(),
+        turn_seq: obs.turn_seq,
+        project_id: harness.project.to_string(),
+        started_at: obs.started_at.unwrap_or(ended_at),
+        ended_at,
+        episode_ref: facts.episode_ref.clone(),
+        trigger_event_id: facts.trigger_event_id.clone(),
+        channel_id: facts.channel_id.clone(),
+        outcome,
+    };
+    serialize_record(&build_record(&ctx, obs, usage))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::turn_record::TurnRecorder;
     use serde_json::json;
+
+    #[test]
+    fn record_for_turn_takes_session_seq_and_start_from_the_observation() {
+        let mut r = TurnRecorder::default();
+        r.begin_turn("20261117_1");
+        r.begin_turn("20261117_1");
+        r.record_stop_reason("end_turn");
+        let obs = r.take().unwrap();
+        let ended = chrono::Utc::now();
+        let facts = TurnFacts {
+            trigger_event_id: Some("cd".repeat(32)),
+            episode_ref: Some("ef".repeat(32)),
+            channel_id: Some("7dfc1946-10d3-4497-8080-94db7575fc70".into()),
+        };
+        let harness = HarnessFacts {
+            project: "project:b5cb944650f21b76",
+            build: Some("1.4.0"),
+            acp_protocol_version: Some(1),
+            agent_version: Some("1.57.0"),
+        };
+        let bytes = record_for_turn(&harness, &facts, &obs, None, TurnOutcome::Answered, ended);
+        let v: serde_json::Value = serde_json::from_slice(bytes.as_bytes()).unwrap();
+        assert_eq!(v["session_id"], "20261117_1");
+        assert_eq!(v["turn_seq"], 2);
+        assert_eq!(v["harness_version"], "1.57.0+buzz.1.4.0");
+        assert_eq!(v["project_id"], "project:b5cb944650f21b76");
+        assert_eq!(v["trigger_event_id"], "cd".repeat(32));
+        assert_eq!(v["episode_ref"], "ef".repeat(32));
+        assert_eq!(v["outcome"], "answered");
+        assert_eq!(v["stop_reason"], "end_turn");
+        let started =
+            chrono::DateTime::parse_from_rfc3339(v["started_at"].as_str().unwrap()).unwrap();
+        let ended_s =
+            chrono::DateTime::parse_from_rfc3339(v["ended_at"].as_str().unwrap()).unwrap();
+        assert!(started <= ended_s);
+        // Null tokens, not zero, with no usage at all.
+        assert!(v["usage"]["input_tokens"].is_null());
+    }
+
+    #[test]
+    fn outcome_follows_engrams_mapping_in_precedence_order() {
+        use TurnOutcome::*;
+        let cases: &[(Option<&str>, bool, bool, TurnOutcome)] = &[
+            (Some("end_turn"), false, false, Answered),
+            (Some("cancelled"), false, false, Answered),
+            (Some("something_new"), false, false, Answered),
+            (None, false, false, Answered),
+            (Some("refusal"), false, false, Refused),
+            (Some("refusal"), false, true, Refused),
+            (Some("max_tokens"), false, false, Degraded),
+            (Some("max_turn_requests"), false, false, Degraded),
+            (Some("end_turn"), false, true, Degraded),
+            (Some("end_turn"), true, false, Error),
+            (Some("refusal"), true, true, Error),
+            (None, true, false, Error),
+        ];
+        for (stop, failed, degraded, want) in cases {
+            assert_eq!(
+                turn_outcome(*stop, *failed, *degraded),
+                *want,
+                "{stop:?} {failed} {degraded}"
+            );
+        }
+    }
 
     fn ctx() -> TurnContext {
         let t = |s: &str| {
