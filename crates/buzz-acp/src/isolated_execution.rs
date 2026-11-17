@@ -67,10 +67,7 @@ pub(crate) async fn execute(
         result = pool::run_isolated_prompt(&mut agent, ctx, prompt, duration, &mut session) => {
             match result {
                 Ok(acp::StopReason::Cancelled) => Outcome::Cancelled,
-                Ok(acp::StopReason::EndTurn) => Outcome::Completed("end_turn".into()),
-                Ok(acp::StopReason::MaxTokens) => Outcome::Completed("max_tokens".into()),
-                Ok(acp::StopReason::MaxTurnRequests) => Outcome::Completed("max_turn_requests".into()),
-                Ok(acp::StopReason::Refusal) => Outcome::Completed("refusal".into()),
+                Ok(stop) => Outcome::Completed(stop.as_wire().to_owned()),
                 Err(acp::AcpError::HardTimeout { .. }) => Outcome::Deadline,
                 Err(acp::AcpError::IdleTimeout(_)) => Outcome::Failed("agent_idle_timeout"),
                 Err(_) => Outcome::Failed("agent_execution_failed"),

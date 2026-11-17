@@ -60,6 +60,13 @@ pub enum StopReason {
     /// Agent refused the prompt (`"refusal"`).
     /// Note: refused turns are dropped from history by the agent.
     Refusal,
+    /// A `stopReason` this build does not recognise, carried verbatim.
+    ///
+    /// ACP may add stop reasons, and an agent may send a non-standard one.
+    /// Neither is a protocol fault: the `session/prompt` response arrived, so
+    /// the turn ended. Failing the turn here would turn a new protocol value
+    /// into an outage, so the raw value is kept and the turn completes.
+    Other(String),
 }
 
 impl StopReason {
@@ -75,6 +82,23 @@ impl StopReason {
             "max_turn_requests" => Some(Self::MaxTurnRequests),
             "refusal" => Some(Self::Refusal),
             _ => None,
+        }
+    }
+
+    /// Parse a wire `stopReason`, keeping an unrecognised value as `Other`.
+    pub fn parse(raw: &str) -> Self {
+        Self::from_str(raw).unwrap_or_else(|| Self::Other(raw.to_owned()))
+    }
+
+    /// The wire form: the canonical name, or the raw value for `Other`.
+    pub fn as_wire(&self) -> &str {
+        match self {
+            Self::EndTurn => "end_turn",
+            Self::Cancelled => "cancelled",
+            Self::MaxTokens => "max_tokens",
+            Self::MaxTurnRequests => "max_turn_requests",
+            Self::Refusal => "refusal",
+            Self::Other(raw) => raw,
         }
     }
 }
@@ -2091,8 +2115,14 @@ impl AcpClient {
         let raw = result["stopReason"].as_str().ok_or_else(|| {
             AcpError::Protocol("session/prompt response missing stopReason".into())
         })?;
-        StopReason::from_str(raw)
-            .ok_or_else(|| AcpError::Protocol(format!("unknown stopReason: {raw:?}")))
+        let stop_reason = StopReason::parse(raw);
+        if let StopReason::Other(raw) = &stop_reason {
+            tracing::warn!(
+                target: "acp::prompt",
+                "unrecognised stopReason {raw:?}: completing the turn and keeping the raw value"
+            );
+        }
+        Ok(stop_reason)
     }
 }
 
@@ -2433,6 +2463,36 @@ mod tests {
         assert_eq!(StopReason::from_str("unknown_value"), None);
         assert_eq!(StopReason::from_str(""), None);
         assert_eq!(StopReason::from_str("endturn"), None); // no camelCase — still unknown
+    }
+
+    #[test]
+    fn stop_reason_parse_keeps_an_unknown_value_verbatim() {
+        // F1: an unrecognised stopReason is carried, never fatal, and never
+        // case-folded — the observation record wants the raw value.
+        assert_eq!(
+            StopReason::parse("tool_limit"),
+            StopReason::Other("tool_limit".into())
+        );
+        assert_eq!(
+            StopReason::parse("Some_New_Reason"),
+            StopReason::Other("Some_New_Reason".into())
+        );
+        assert_eq!(StopReason::parse(""), StopReason::Other(String::new()));
+        assert_eq!(StopReason::parse("END_TURN"), StopReason::EndTurn);
+    }
+
+    #[test]
+    fn stop_reason_as_wire_round_trips() {
+        for raw in [
+            "end_turn",
+            "cancelled",
+            "max_tokens",
+            "max_turn_requests",
+            "refusal",
+            "tool_limit",
+        ] {
+            assert_eq!(StopReason::parse(raw).as_wire(), raw);
+        }
     }
 
     #[test]
@@ -4520,6 +4580,31 @@ mod tests {
         assert_eq!(usage.cumulative_cost_usd, Some(0.5));
         drop(client);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn unknown_stop_reason_completes_the_turn() {
+        // F1, the regression this exists for: before, an unknown value was
+        // `AcpError::Protocol` and failed the whole turn.
+        let mut client = spawn_inert_client().await;
+        let stop = client
+            .parse_prompt_response(
+                "unknown-stop-session",
+                &serde_json::json!({"stopReason": "tool_limit"}),
+            )
+            .expect("an unknown stopReason must not be a protocol error");
+        assert_eq!(stop, StopReason::Other("tool_limit".into()));
+    }
+
+    #[tokio::test]
+    async fn missing_stop_reason_is_still_a_protocol_error() {
+        // The negative control: a response with no stopReason at all is
+        // malformed, and stays an error. F1 widens values, not shape.
+        let mut client = spawn_inert_client().await;
+        let err = client
+            .parse_prompt_response("no-stop-session", &serde_json::json!({}))
+            .expect_err("a missing stopReason is malformed");
+        assert!(matches!(err, AcpError::Protocol(_)));
     }
 
     #[tokio::test]

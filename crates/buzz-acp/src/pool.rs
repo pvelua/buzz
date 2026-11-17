@@ -4945,6 +4945,9 @@ fn log_stop_reason(source: &PromptSource, stop_reason: &StopReason) {
         StopReason::Refusal => {
             tracing::warn!(target: "pool::prompt", "turn refused for {label}");
         }
+        StopReason::Other(raw) => {
+            tracing::warn!(target: "pool::prompt", "turn complete for {label}: unrecognised stopReason {raw:?}");
+        }
     }
 }
 
@@ -5208,6 +5211,7 @@ fn acp_stop_to_core(r: &StopReason) -> buzz_core::agent_turn_metric::StopReason 
         StopReason::MaxTokens => CoreStop::MaxTokens,
         StopReason::MaxTurnRequests => CoreStop::Unknown,
         StopReason::Refusal => CoreStop::Unknown,
+        StopReason::Other(_) => CoreStop::Unknown,
     }
 }
 
