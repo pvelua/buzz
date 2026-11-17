@@ -19,6 +19,14 @@
 //! ⚠️ **Only the 404 whose body says `[observation_disabled]` is a switch.**
 //! A bare 404 is a wrong URL or a server too old for the route, and treating
 //! it as "off" would hide a misconfiguration behind silence.
+//!
+//! ⚠️ **Logs use this module's own target (`buzz_acp::turn_sender`), never a
+//! custom one.** The agents filter on `buzz_acp=info`, which matches targets
+//! by prefix, so a line under `target: "turn_record::send"` never prints at
+//! the default level. Measured on the DEV coder 2026-11-17: in three days of
+//! log, zero lines from upstream's `pool::prompt` target, while every
+//! `buzz_acp::engram_skill` line is there. The first cut of this sender used a
+//! custom target, which would have made even "NOT started" silent.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -218,14 +226,12 @@ impl TurnSender {
         match self.tx.try_send(record) {
             Ok(()) => {}
             Err(tokio::sync::mpsc::error::TrySendError::Full(r)) => tracing::warn!(
-                target: "turn_record::send",
                 turn = %describe(&r),
                 "turn-record queue full ({QUEUE_DEPTH}); dropping this record"
             ),
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => tracing::debug!(
-                target: "turn_record::send",
-                "turn-record sender has stopped; record not queued"
-            ),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                tracing::debug!("turn-record sender has stopped; record not queued")
+            }
         }
     }
 
@@ -259,7 +265,7 @@ impl Observation {
             Ok(None) => return None,
             Ok(Some(config)) => config,
             Err(e) => {
-                tracing::error!(target: "turn_record::send", "turn observation: NOT started: {e}");
+                tracing::error!("turn observation: NOT started: {e}");
                 return None;
             }
         };
@@ -268,7 +274,7 @@ impl Observation {
         let sender = match TurnSender::spawn(config) {
             Ok(sender) => sender,
             Err(e) => {
-                tracing::error!(target: "turn_record::send", "turn observation: NOT started: {e}");
+                tracing::error!("turn observation: NOT started: {e}");
                 return None;
             }
         };
@@ -277,7 +283,6 @@ impl Observation {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
         tracing::info!(
-            target: "turn_record::send",
             "turn observation: enabled, endpoint={endpoint} project={project} build={}",
             build.as_deref().unwrap_or("unknown")
         );
@@ -336,7 +341,7 @@ async fn run(
                     d
                 }
                 Err(e) => {
-                    tracing::warn!(target: "turn_record::send", %turn, "send failed: {e}");
+                    tracing::warn!(%turn, "send failed: {e}");
                     Disposition::Retry
                 }
             };
@@ -348,7 +353,6 @@ async fn run(
                     }
                     None => {
                         tracing::warn!(
-                            target: "turn_record::send",
                             %turn,
                             attempts = attempt + 1,
                             "giving up on this turn record after retries"
@@ -377,35 +381,30 @@ fn log_disposition(turn: &str, d: &Disposition, status: u16, body: &str) {
         .collect();
     match d {
         Disposition::Stored => {
-            tracing::info!(target: "turn_record::send", %turn, "turn record stored")
+            tracing::info!(%turn, "turn record stored")
         }
         Disposition::Duplicate => {
-            tracing::info!(target: "turn_record::send", %turn, "turn record already held (duplicate)")
+            tracing::info!(%turn, "turn record already held (duplicate)")
         }
         Disposition::Conflict => tracing::warn!(
-            target: "turn_record::send",
             %turn,
             "409 turn_key_conflict: the first write stands. This is a SENDER bug -- a record was \
              rebuilt instead of resent. Not retried."
         ),
         Disposition::Disabled => tracing::info!(
-            target: "turn_record::send",
             %turn,
             "ENGRAM says observation is disabled; no further turn records will be sent"
         ),
         Disposition::Misconfigured => tracing::error!(
-            target: "turn_record::send",
             %turn,
             "404 without [observation_disabled]: wrong ENGRAM URL, or a server too old for \
              /api/agent-turns ({detail})"
         ),
         Disposition::Rejected(code) => tracing::warn!(
-            target: "turn_record::send",
             %turn,
             "turn record rejected with {code}: {detail}"
         ),
         Disposition::Retry => tracing::warn!(
-            target: "turn_record::send",
             %turn,
             "retryable {status}: {detail}"
         ),
