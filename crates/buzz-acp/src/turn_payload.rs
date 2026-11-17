@@ -103,11 +103,17 @@ impl TurnRecordBytes {
 
 /// `<goose version>+buzz.<build>`, at most 64 characters (API note,
 /// `harness_version`). An unknown half is written `unknown` rather than
-/// omitted, so the string still says which half is missing.
+/// omitted, so the string still says which half is missing. A leading `v`
+/// before a digit is dropped from either half: CI's `BUZZ_BUILD` is the git
+/// tag (`v1.4.0`), and the note's form is `1.57.0+buzz.1.3.1`.
 pub(crate) fn harness_version(goose: Option<&str>, build: Option<&str>) -> String {
     let clean = |v: Option<&str>| {
         v.map(str::trim)
             .filter(|v| !v.is_empty())
+            .map(|v| match v.strip_prefix('v') {
+                Some(rest) if rest.starts_with(|c: char| c.is_ascii_digit()) => rest,
+                _ => v,
+            })
             .unwrap_or("unknown")
             .to_string()
     };
@@ -521,6 +527,19 @@ mod tests {
         );
         assert_eq!(harness_version(None, Some("1.4.0")), "unknown+buzz.1.4.0");
         assert_eq!(harness_version(Some(" "), None), "unknown+buzz.unknown");
+        // D1f: CI's BUZZ_BUILD is the tag.
+        assert_eq!(
+            harness_version(Some("v1.57.0"), Some("v1.4.0")),
+            "1.57.0+buzz.1.4.0"
+        );
+        assert_eq!(
+            harness_version(Some("1.57.0"), Some("dev")),
+            "1.57.0+buzz.dev"
+        );
+        assert_eq!(
+            harness_version(Some("1.57.0"), Some("vnext")),
+            "1.57.0+buzz.vnext"
+        );
         let long = harness_version(Some(&"9".repeat(80)), Some("1.4.0"));
         assert_eq!(long.len(), 64);
     }
