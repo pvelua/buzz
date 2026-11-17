@@ -26,6 +26,11 @@ mod runtime;
 use runtime::{AgentRuntime, PoolStartup, SessionMode};
 mod scope;
 mod setup_mode;
+// Track D1: unused until the wiring (D1e) calls them. Remove both allows then;
+// a leftover allow would hide dead code that D1e should have used.
+#[allow(dead_code)]
+mod turn_payload;
+#[allow(dead_code)]
 mod turn_record;
 mod usage;
 

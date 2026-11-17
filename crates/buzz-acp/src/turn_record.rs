@@ -44,7 +44,6 @@ pub(crate) struct ToolCall {
 }
 
 /// One `(extension, name)` row of the record's `tools` aggregate.
-#[allow(dead_code)] // built by the record builder, D1b
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ToolAggregate {
     pub extension: Option<String>,
@@ -74,7 +73,6 @@ pub(crate) struct TurnObservation {
     pub raw_capped: bool,
 }
 
-#[allow(dead_code)] // called by the record builder, D1b
 impl TurnObservation {
     /// The `tools` aggregate: one row per `(extension, name)`, in order of
     /// first sight. A call counts as an error when its status is `failed`.
@@ -166,21 +164,23 @@ impl TurnRecorder {
             }
         }
         let update = &msg["params"]["update"];
+        // The model is on message chunks AND on tool calls (design §3,
+        // `usage` row), so a turn that only called tools still names it.
+        let inference = update
+            .pointer("/_meta/goose/inference")
+            .or_else(|| update.pointer("/content/_meta/goose/inference"));
+        if let Some(inference) = inference {
+            if let Some(m) = str_at(inference, "/requestedModel") {
+                cur.obs.model = Some(m.to_string());
+            }
+            if let Some(p) = str_at(inference, "/provider") {
+                cur.obs.provider = Some(p.to_string());
+            }
+        }
         match str_at(update, "/sessionUpdate").unwrap_or("") {
             "agent_message_chunk" => {
                 if let Some(text) = str_at(update, "/content/text") {
                     push_capped(&mut cur.obs.channel_text, text, &mut cur.obs.raw_capped);
-                }
-                let inference = update
-                    .pointer("/_meta/goose/inference")
-                    .or_else(|| update.pointer("/content/_meta/goose/inference"));
-                if let Some(inference) = inference {
-                    if let Some(m) = str_at(inference, "/requestedModel") {
-                        cur.obs.model = Some(m.to_string());
-                    }
-                    if let Some(p) = str_at(inference, "/provider") {
-                        cur.obs.provider = Some(p.to_string());
-                    }
                 }
             }
             "agent_thought_chunk" => {
@@ -450,6 +450,22 @@ mod tests {
             Some("END_TURN"),
             "verbatim, not case-folded"
         );
+    }
+
+    #[test]
+    fn the_model_is_read_from_a_tool_call_too() {
+        let mut r = TurnRecorder::default();
+        r.begin_turn("s");
+        r.observe(&update(
+            "s",
+            json!({"sessionUpdate":"tool_call","toolCallId":"t",
+                   "_meta":{"goose":{"toolCall":{"toolName":"shell","extensionName":"developer"},
+                                     "inference":{"provider":"google",
+                                                  "requestedModel":"gemini-3.8-flash"}}}}),
+        ));
+        let obs = r.take().unwrap();
+        assert_eq!(obs.model.as_deref(), Some("gemini-3.8-flash"));
+        assert_eq!(obs.provider.as_deref(), Some("google"));
     }
 
     #[test]
