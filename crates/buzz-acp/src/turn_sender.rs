@@ -540,6 +540,21 @@ mod tests {
         assert_eq!(classify(429, ""), Disposition::Retry);
     }
 
+    /// The exact bodies ENGRAM DEV returned on 2026-11-17 (D1g route probe,
+    /// session `d1g-probe-20261117T232037Z`, as the DEV coder `user_067`).
+    /// If ENGRAM rewords a refusal, this is where it shows.
+    #[test]
+    fn classify_matches_engram_devs_live_responses() {
+        let stored = r#"{"outcome":"stored","turn_key":"8923c316d77e19c3f4fb88a9c48b29242a680b964c35c338fe93a386e6e6fb43","blob_stored":true,"blob_truncated":false,"skill_unresolved":false}"#;
+        let duplicate = r#"{"outcome":"duplicate","turn_key":"8923c316d77e19c3f4fb88a9c48b29242a680b964c35c338fe93a386e6e6fb43"}"#;
+        let conflict = r#"{"detail":"[turn_key_conflict] A turn with this key was already stored with a different body; a retry must resend the same record"}"#;
+        let not_found = r#"{"detail":"Not Found"}"#;
+        assert_eq!(classify(200, stored), Disposition::Stored);
+        assert_eq!(classify(200, duplicate), Disposition::Duplicate);
+        assert_eq!(classify(409, conflict), Disposition::Conflict);
+        assert_eq!(classify(404, not_found), Disposition::Misconfigured);
+    }
+
     // ── against a real HTTP server ──────────────────────────────────────────
 
     struct Server {
