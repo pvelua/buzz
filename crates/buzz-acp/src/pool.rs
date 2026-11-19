@@ -1522,22 +1522,25 @@ async fn create_session_and_apply_model(
         );
     }
     let combined_system_prompt = with_assigned_skill(
-        with_canvas(
-            with_huddle_instructions(
-                with_core(
-                    with_team(
-                        framed_system_prompt(
-                            &ctx.cwd,
-                            ctx.base_prompt.as_deref(),
-                            ctx.system_prompt.as_deref(),
+        with_self_assessment(
+            with_canvas(
+                with_huddle_instructions(
+                    with_core(
+                        with_team(
+                            framed_system_prompt(
+                                &ctx.cwd,
+                                ctx.base_prompt.as_deref(),
+                                ctx.system_prompt.as_deref(),
+                            ),
+                            ctx.team_instructions.as_deref(),
                         ),
-                        ctx.team_instructions.as_deref(),
+                        agent_core,
                     ),
-                    agent_core,
+                    channel.huddle_instructions,
                 ),
-                channel.huddle_instructions,
+                channel.canvas,
             ),
-            channel.canvas,
+            ctx.observation.is_some(),
         ),
         assigned_skill_bootstrap.as_deref(),
     );
@@ -2259,6 +2262,25 @@ fn with_core(framed: Option<String>, core: Option<&str>) -> Option<String> {
         (None, Some(core)) => Some(core),
         (None, None) => None,
     }
+}
+
+/// Append the self-assessment instruction (D3) when this agent observes its
+/// turns. Without observation nothing reads the answer, so nothing is asked:
+/// the instruction costs tokens on every session and must buy something.
+///
+/// It sits just before the assigned-skill section, which stays last.
+fn with_self_assessment(prompt: Option<String>, observing: bool) -> Option<String> {
+    if !observing {
+        return prompt;
+    }
+    let section = crate::prompt_framing::semantic_section(
+        "turn-self-assessment",
+        crate::self_assessment::INSTRUCTION,
+    );
+    Some(match prompt {
+        Some(prompt) => format!("{prompt}\n\n{section}"),
+        None => section,
+    })
 }
 
 /// Append the instruction to load the ENGRAM-assigned skill and its references.
@@ -5350,8 +5372,39 @@ async fn finish_turn(
             chrono::Utc::now(),
         );
         observation.sender.submit(bytes);
+        log_self_assessment(&obs);
     }
     publish_agent_turn_metric(ctx, usage, channel_id, session_id, turn_id, stop_reason).await;
+}
+
+/// One line per DELIVERING turn saying whether the self-assessment came back
+/// (D3), because the record is not readable from here and an omitted field is
+/// otherwise silent. Plus one WARN if the assessment reached a channel: the
+/// harness cannot unsend it, so the log is the only place it shows.
+fn log_self_assessment(obs: &crate::turn_record::TurnObservation) {
+    let turn = format!("{}#{}", obs.session_id, obs.turn_seq);
+    if obs.assessment_leaked {
+        tracing::warn!(
+            turn = %turn,
+            "self-assessment: the tag was in an accepted send, so it was POSTED to a channel"
+        );
+    }
+    if obs.sends.is_empty() {
+        return;
+    }
+    match crate::turn_payload::self_assessment(obs) {
+        Some(a) => tracing::info!(
+            turn = %turn,
+            quality = ?a.quality,
+            obstacles = a.obstacles.len(),
+            suggestions = a.suggestions.len(),
+            "self-assessment: present"
+        ),
+        None => tracing::info!(
+            turn = %turn,
+            "self-assessment: absent (no block in the agreed shape at the end of the final message); field omitted"
+        ),
+    }
 }
 
 /// Best-effort: build and publish a `kind:44200` NIP-AM agent turn metric event.
@@ -12369,5 +12422,41 @@ mod assigned_skill_prompt_tests {
         let out = with_assigned_skill(None, Some(INSTRUCTION)).unwrap();
         assert!(out.contains("assigned-skill"));
         assert!(out.contains(INSTRUCTION));
+    }
+}
+
+#[cfg(test)]
+mod self_assessment_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn the_instruction_is_asked_only_when_the_agent_observes_its_turns() {
+        assert_eq!(
+            with_self_assessment(Some("base".into()), false).as_deref(),
+            Some("base")
+        );
+        assert_eq!(with_self_assessment(None, false), None);
+
+        let on = with_self_assessment(Some("base".into()), true).unwrap();
+        assert!(on.starts_with("base\n\n"));
+        assert!(on.contains(crate::self_assessment::INSTRUCTION));
+        assert_eq!(on.matches(crate::self_assessment::INSTRUCTION).count(), 1);
+        assert!(with_self_assessment(None, true)
+            .unwrap()
+            .contains(crate::self_assessment::INSTRUCTION));
+    }
+
+    /// The skill bootstrap must stay the LAST section (see
+    /// `with_assigned_skill`), so the assessment goes before it.
+    #[test]
+    fn the_assigned_skill_section_stays_last() {
+        let prompt = with_assigned_skill(
+            with_self_assessment(Some("base".into()), true),
+            Some("load_skill(name: \"buzz-coder\")"),
+        )
+        .unwrap();
+        let assess = prompt.find(crate::self_assessment::INSTRUCTION).unwrap();
+        let skill = prompt.find("load_skill(name: \"buzz-coder\")").unwrap();
+        assert!(assess < skill, "{prompt}");
     }
 }

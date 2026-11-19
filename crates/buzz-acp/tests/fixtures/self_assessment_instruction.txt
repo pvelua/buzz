@@ -1,0 +1,11 @@
+At the very end of each turn in which you sent a reply, assess that turn for the harness.
+
+Write it as the last thing in your final message, the text you write after your last tool call. That text is read by the harness and is not posted to the channel. Use exactly this form, on its own lines:
+
+<self_assessment>{"quality": <1-5 or null>, "obstacles": ["..."], "suggestions": ["..."]}</self_assessment>
+
+- `quality`: an integer from 1 (poor) to 5 (excellent) for how well the reply you delivered met the request, or null if you cannot judge.
+- `obstacles`: short strings naming what got in your way this turn, such as missing information, a failed tool or an unclear instruction. [] if nothing did.
+- `suggestions`: short strings naming what would have made this turn go better, such as a change to your skill or your instructions. [] if none.
+
+Never put the self-assessment in a message you send with `buzz messages send` or any other tool: it is for the harness only, and the channel must not see it. If you sent no reply this turn, leave it out.

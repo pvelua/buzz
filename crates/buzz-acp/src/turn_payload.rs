@@ -143,7 +143,11 @@ fn rfc3339(t: chrono::DateTime<chrono::Utc>) -> String {
 /// - **`delivered`** from the accepted sends, see [`delivered`].
 /// - **`skill`** (D2) is the installed skill as the turn began, present only
 ///   when one was installed with its ids; absent otherwise, never null.
-/// - **Not built here:** `self_assessment` (D3). Absent rather than null.
+/// - **`self_assessment`** (D3) only on a turn that delivered, and only when
+///   the final message ends with a block in exactly the agreed shape; absent
+///   otherwise, never null and never guessed. See [`self_assessment`].
+/// - **`raw.channel_text`** has every assessment block stripped, so the blob
+///   does not hold the model's account a second time.
 pub(crate) fn build_record(
     ctx: &TurnContext,
     obs: &TurnObservation,
@@ -196,7 +200,7 @@ pub(crate) fn build_record(
         "outcome": ctx.outcome.as_str(),
         "stop_reason": obs.stop_reason,
         "raw": {
-            "channel_text": obs.channel_text,
+            "channel_text": crate::self_assessment::strip(&obs.channel_text),
             "reasoning": obs.reasoning,
             "tool_results": obs.tool_results,
         },
@@ -206,8 +210,23 @@ pub(crate) fn build_record(
     }
     if let Some(delivered) = delivered(ctx, obs) {
         record["delivered"] = delivered;
+        if let Some(assessment) = self_assessment(obs) {
+            record["self_assessment"] = assessment.to_json();
+        }
     }
     record
+}
+
+/// The model's own account (D3), read from the END of the turn's final
+/// message. `None` on a turn that did not deliver, whatever the text says:
+/// the API note sends it only on a delivering turn.
+pub(crate) fn self_assessment(
+    obs: &TurnObservation,
+) -> Option<crate::self_assessment::SelfAssessment> {
+    if obs.sends.is_empty() {
+        return None;
+    }
+    crate::self_assessment::extract(&obs.final_text)
 }
 
 /// `delivered` (API note `03f40ec8`): present when at least one send was
@@ -473,6 +492,79 @@ mod tests {
                 "digest": format!("sha256:{}", "0".repeat(64)),
             })
         );
+    }
+
+    // ── D3: self_assessment ─────────────────────────────────────────────
+
+    const OWN: &str = "7dfc1946-10d3-4497-8080-94db7575fc70";
+    const BLOCK: &str = "<self_assessment>{\"quality\": 3, \"obstacles\": [\"no runner\"], \"suggestions\": []}</self_assessment>";
+
+    fn with_final(text: &str, delivered: bool) -> TurnObservation {
+        let mut obs = observed();
+        obs.channel_text = format!("Sent it.\n\n{text}");
+        obs.final_text = format!("Sent it.\n\n{text}");
+        if delivered {
+            obs.sends = vec![send('1', Some(OWN))];
+        }
+        obs
+    }
+
+    #[test]
+    fn a_delivering_turn_carries_the_assessment_and_the_blob_does_not() {
+        let v = build_record(&ctx(), &with_final(BLOCK, true), None);
+        assert_eq!(
+            v["self_assessment"],
+            json!({"quality": 3, "obstacles": ["no runner"], "suggestions": []})
+        );
+        assert_eq!(
+            v["raw"]["channel_text"], "Sent it.",
+            "the block is stripped from the raw text, which keeps the rest"
+        );
+    }
+
+    /// The API note sends it only on a delivering turn, so a block on a turn
+    /// that sent nothing is dropped -- and still stripped from the blob.
+    #[test]
+    fn a_turn_that_delivered_nothing_has_no_assessment_whatever_its_text_says() {
+        let v = build_record(&ctx(), &with_final(BLOCK, false), None);
+        assert!(v.get("self_assessment").is_none());
+        assert!(v.get("delivered").is_none());
+        assert_eq!(v["raw"]["channel_text"], "Sent it.");
+    }
+
+    /// A hand-off is a delivery by the API note's rule (at least one accepted
+    /// send, anywhere), so it carries the assessment too.
+    #[test]
+    fn a_hand_off_counts_as_delivering() {
+        let mut obs = with_final(BLOCK, false);
+        obs.sends = vec![send('9', Some("1d98c187-8686-4bd6-b88c-ffc4d410471e"))];
+        let v = build_record(&ctx(), &obs, None);
+        assert!(v["delivered"]["event_id"].is_null());
+        assert_eq!(v["self_assessment"]["quality"], 3);
+    }
+
+    #[test]
+    fn a_malformed_block_is_omitted_absent_not_null() {
+        let bad = "<self_assessment>{\"quality\": 9, \"obstacles\": [], \"suggestions\": []}</self_assessment>";
+        let v = build_record(&ctx(), &with_final(bad, true), None);
+        assert!(
+            v.get("self_assessment").is_none(),
+            "out of range means omitted, never clamped and never null"
+        );
+        assert!(
+            v.get("delivered").is_some(),
+            "the turn itself is unaffected"
+        );
+    }
+
+    /// Read from the FINAL message only: a block written before a later tool
+    /// call was not the end of the turn.
+    #[test]
+    fn a_block_before_the_last_tool_call_does_not_count() {
+        let mut obs = with_final(BLOCK, true);
+        obs.final_text = "And then one more thing.".into();
+        let v = build_record(&ctx(), &obs, None);
+        assert!(v.get("self_assessment").is_none());
     }
 
     #[test]

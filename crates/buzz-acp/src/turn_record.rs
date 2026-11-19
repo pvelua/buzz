@@ -83,6 +83,14 @@ pub(crate) struct TurnObservation {
     /// then, not at the end, so a refetch that lands while this turn runs in
     /// another channel is reported by the next turn rather than this one.
     pub skill: Option<crate::engram_skill::SkillRef>,
+    /// The turn's FINAL message: the text since the last new tool call (D3).
+    /// The self-assessment is asked for at its end, and this is where it is
+    /// read from; `channel_text` holds the whole turn's text.
+    pub final_text: String,
+    /// An accepted send's command carried the self-assessment tag, so the
+    /// assessment reached a channel (D3). The record is still built; the
+    /// turn logs one WARN.
+    pub assessment_leaked: bool,
 }
 
 /// One accepted `buzz messages send`, read from the shell call's own command
@@ -161,6 +169,22 @@ fn push_capped(buf: &mut String, text: &str, capped: &mut bool) {
     }
 }
 
+/// The final message is read only for its end, so keep the LAST
+/// [`FINAL_TEXT_CAP`] bytes: a long message loses its start, never the
+/// assessment that closes it.
+const FINAL_TEXT_CAP: usize = 64 * 1024;
+
+fn push_tail(buf: &mut String, text: &str) {
+    buf.push_str(text);
+    if buf.len() > FINAL_TEXT_CAP {
+        let mut cut = buf.len() - FINAL_TEXT_CAP;
+        while !buf.is_char_boundary(cut) {
+            cut += 1;
+        }
+        buf.drain(..cut);
+    }
+}
+
 impl TurnRecorder {
     /// Start a turn. Discards anything left from a turn never taken.
     pub fn begin_turn(&mut self, session_id: &str) {
@@ -223,6 +247,7 @@ impl TurnRecorder {
             "agent_message_chunk" => {
                 if let Some(text) = str_at(update, "/content/text") {
                     push_capped(&mut cur.obs.channel_text, text, &mut cur.obs.raw_capped);
+                    push_tail(&mut cur.obs.final_text, text);
                 }
             }
             "agent_thought_chunk" => {
@@ -237,6 +262,9 @@ impl TurnRecorder {
                 let idx = match cur.index.get(id) {
                     Some(&i) => i,
                     None => {
+                        // A new tool call: the text before it was not the
+                        // final message.
+                        cur.obs.final_text.clear();
                         cur.obs.tool_calls.push(ToolCall {
                             extension: None,
                             name: None,
@@ -307,7 +335,11 @@ impl TurnRecorder {
                 if became_terminal {
                     if let Some(command) = cur.send_commands.get(&idx) {
                         let output = tool_output_text(update).unwrap_or_default();
-                        cur.obs.sends.extend(accepted_sends(command, &output));
+                        let accepted = accepted_sends(command, &output);
+                        if !accepted.is_empty() && crate::self_assessment::mentions_tag(command) {
+                            cur.obs.assessment_leaked = true;
+                        }
+                        cur.obs.sends.extend(accepted);
                     }
                 }
             }
@@ -834,5 +866,102 @@ mod tests {
         // A new turn starts clean: the snapshot is retaken, never inherited.
         rec.begin_turn("s");
         assert_eq!(rec.take().unwrap().skill, None);
+    }
+}
+
+#[cfg(test)]
+mod self_assessment_capture_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn up(u: serde_json::Value) -> serde_json::Value {
+        json!({"method":"session/update","params":{"sessionId":"s1","update":u}})
+    }
+    fn text(t: &str) -> serde_json::Value {
+        up(json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":t}}))
+    }
+    fn shell(id: &str, command: &str) -> serde_json::Value {
+        up(
+            json!({"sessionUpdate":"tool_call","toolCallId":id,"status":"pending",
+            "rawInput":{"command":command},
+            "_meta":{"goose":{"toolCall":{"toolName":"shell","extensionName":"developer"}}}}),
+        )
+    }
+    fn done(id: &str, stdout: &str) -> serde_json::Value {
+        up(
+            json!({"sessionUpdate":"tool_call_update","toolCallId":id,"status":"completed",
+            "rawOutput":{"stdout":stdout,"stderr":"","exit_code":0}}),
+        )
+    }
+    const OK: &str = r#"{"accepted":true,"event_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","mention_pubkeys":[],"message":""}"#;
+
+    #[test]
+    fn the_final_message_is_the_text_after_the_last_new_tool_call() {
+        let mut r = TurnRecorder::default();
+        r.begin_turn("s1");
+        r.observe(&text("Let me reply. "));
+        r.observe(&shell(
+            "t1",
+            "buzz messages send --channel c --content \"hi\"",
+        ));
+        r.observe(&done("t1", OK));
+        r.observe(&text("Replied. "));
+        r.observe(&text("<self_assessment>{}</self_assessment>"));
+        let obs = r.take().unwrap();
+        assert_eq!(
+            obs.final_text,
+            "Replied. <self_assessment>{}</self_assessment>"
+        );
+        assert_eq!(
+            obs.channel_text, "Let me reply. Replied. <self_assessment>{}</self_assessment>",
+            "channel_text still holds the whole turn"
+        );
+        assert!(
+            !obs.assessment_leaked,
+            "the block was in the final text, not a send"
+        );
+    }
+
+    #[test]
+    fn a_completion_after_the_text_does_not_clear_it_only_a_new_call_does() {
+        let mut r = TurnRecorder::default();
+        r.begin_turn("s1");
+        r.observe(&shell("t1", "ls"));
+        r.observe(&text("final"));
+        r.observe(&done("t1", "x")); // a late update for a call already seen
+        assert_eq!(r.take().unwrap().final_text, "final");
+
+        r.begin_turn("s1");
+        r.observe(&text("not final"));
+        r.observe(&shell("t2", "ls"));
+        assert_eq!(r.take().unwrap().final_text, "");
+    }
+
+    #[test]
+    fn the_tag_in_an_accepted_send_is_a_leak_and_in_a_refused_one_is_not() {
+        let leaking =
+            "buzz messages send --channel c --content \"ok <self_assessment>{}</self_assessment>\"";
+        let mut r = TurnRecorder::default();
+        r.begin_turn("s1");
+        r.observe(&shell("t1", leaking));
+        r.observe(&done("t1", OK));
+        assert!(r.take().unwrap().assessment_leaked);
+
+        // Negative control: the same command, not accepted, posted nothing.
+        r.begin_turn("s1");
+        r.observe(&shell("t1", leaking));
+        r.observe(&done("t1", "error: relay refused"));
+        assert!(!r.take().unwrap().assessment_leaked);
+    }
+
+    #[test]
+    fn the_final_text_keeps_its_end_when_it_is_over_the_cap() {
+        let mut r = TurnRecorder::default();
+        r.begin_turn("s1");
+        r.observe(&text(&"é".repeat(FINAL_TEXT_CAP)));
+        r.observe(&text("<self_assessment>END</self_assessment>"));
+        let t = r.take().unwrap().final_text;
+        assert!(t.len() <= FINAL_TEXT_CAP);
+        assert!(t.ends_with("<self_assessment>END</self_assessment>"));
     }
 }

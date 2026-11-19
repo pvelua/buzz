@@ -25,6 +25,7 @@ mod run_task;
 mod runtime;
 use runtime::{AgentRuntime, PoolStartup, SessionMode};
 mod scope;
+mod self_assessment;
 mod setup_mode;
 // Track D1: ENGRAM's per-turn record. Built in D1a–D1d, wired in D1e.
 mod turn_payload;
