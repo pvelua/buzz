@@ -64,6 +64,140 @@ pub struct SkillFile {
     pub content: String,
 }
 
+/// The assigned root's identity, as `get_assigned_skill` returned it (seam
+/// §7.1: `skill.{chain_id, version_id}` and the response's `resolved_at`).
+///
+/// ⚠️ Each id is read from its own field and never inferred from another:
+/// §7.1 says so in terms, and on a revised chain they differ (`version_id` is
+/// the head, `chain_id` the first version).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSkill {
+    pub chain_id: String,
+    pub version_id: String,
+    /// ENGRAM's own resolution time, verbatim. `None` when the response did
+    /// not carry it.
+    pub resolved_at: Option<String>,
+}
+
+/// A turn record's `skill` (D2; API note `03f40ec8`): which version ENGRAM
+/// resolved, and which bytes landed on disk.
+///
+/// The two halves are a cross-check, not duplicates: the ids say what ENGRAM
+/// delivered, the digest what the agent could actually read, and a mismatch
+/// between turns is the swap-mid-session case the judge must not misattribute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillRef {
+    pub chain_id: String,
+    pub version_id: String,
+    /// `resolved_at` when the response carried it, else the local install time.
+    pub fetched_at: String,
+    /// `sha256:<hex>` of the installed directory, see [`directory_digest`].
+    pub digest: String,
+}
+
+impl SkillRef {
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "chain_id": self.chain_id,
+            "version_id": self.version_id,
+            "fetched_at": self.fetched_at,
+            "digest": self.digest,
+        })
+    }
+}
+
+/// The content digest of an installed skill directory, read back **from
+/// disk** after the swap, so it describes what the agent can read rather than
+/// what we meant to write.
+///
+/// Canonical form: every regular file under `dir`, by its POSIX-relative path
+/// sorted bytewise; for each, the path bytes, a `0x00`, the content length as
+/// a big-endian `u64`, then the content. The length prefix keeps two
+/// different file sets from hashing alike by moving bytes across a boundary.
+/// Symlinks are not followed and not hashed: the writer never makes one.
+pub fn directory_digest(dir: &Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+
+    fn walk(base: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> std::io::Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let ty = entry.file_type()?;
+            let path = entry.path();
+            if ty.is_dir() {
+                walk(base, &path, out)?;
+            } else if ty.is_file() {
+                let rel = path
+                    .strip_prefix(base)
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                let rel = rel
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                out.push((rel, path));
+            }
+        }
+        Ok(())
+    }
+
+    let mut files = Vec::new();
+    walk(dir, dir, &mut files)?;
+    files.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    let mut hasher = Sha256::new();
+    for (rel, path) in files {
+        let bytes = fs::read(&path)?;
+        hasher.update(rel.as_bytes());
+        hasher.update([0u8]);
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(&bytes);
+    }
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
+}
+
+/// Build the [`InstalledSkill`] for a skill that `write_into` just put at
+/// `path`. The `SkillRef` is absent when the response carried no ids (a server
+/// older than §7.1's ids) or the digest could not be read back; both are
+/// logged, because an absent `skill` leaves that turn unattributed for good.
+pub fn installed_from(
+    skill: &SkillMd,
+    path: &Path,
+    resolved: Option<&ResolvedSkill>,
+) -> InstalledSkill {
+    let skill_ref = match resolved {
+        None => {
+            tracing::warn!(
+                "engram skill: the response carried no `skill.chain_id`/`version_id`; \
+                 turn records will carry no `skill`"
+            );
+            None
+        }
+        Some(r) => match directory_digest(path) {
+            Ok(digest) => Some(SkillRef {
+                chain_id: r.chain_id.clone(),
+                version_id: r.version_id.clone(),
+                fetched_at: r.resolved_at.clone().unwrap_or_else(|| {
+                    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                }),
+                digest,
+            }),
+            Err(e) => {
+                tracing::error!(
+                    path = %path.display(),
+                    error = %e,
+                    "engram skill: installed, but its digest could not be read back; \
+                     turn records will carry no `skill`"
+                );
+                None
+            }
+        },
+    };
+    InstalledSkill {
+        directory: skill.directory.clone(),
+        references: skill.reference_paths(),
+        skill_ref,
+    }
+}
+
 /// Why a payload was refused, or a write failed. Every variant names the
 /// offending value: a refusal that does not say which path was wrong is a
 /// refusal the operator cannot act on.
@@ -692,6 +826,9 @@ pub struct Fetched {
     /// same shape as "complete" on purpose — a failed fetch has no parts to
     /// be missing.
     pub unreadable_parts: Vec<UnreadablePart>,
+    /// The root's ids (D2). `Some` only on `Assigned`, and only when the
+    /// response carried both ids as strings.
+    pub resolved: Option<ResolvedSkill>,
 }
 
 impl Fetched {
@@ -701,6 +838,7 @@ impl Fetched {
             skill_md: None,
             require_assigned_skill: None,
             unreadable_parts: Vec::new(),
+            resolved: None,
         }
     }
 
@@ -710,6 +848,7 @@ impl Fetched {
             skill_md: None,
             require_assigned_skill: None,
             unreadable_parts: Vec::new(),
+            resolved: None,
         }
     }
 
@@ -720,6 +859,7 @@ impl Fetched {
             skill_md: None,
             require_assigned_skill,
             unreadable_parts: Vec::new(),
+            resolved: None,
         }
     }
 }
@@ -853,6 +993,7 @@ pub fn interpret_payload(text: &str) -> Fetched {
                     skill_md: Some(skill_md),
                     require_assigned_skill,
                     unreadable_parts: read_unreadable_parts(&value),
+                    resolved: read_resolved(&value),
                 },
                 Err(e) => Fetched::failed(format!("`skill_md` did not parse: {e}")),
             },
@@ -861,6 +1002,30 @@ pub fn interpret_payload(text: &str) -> Fetched {
             None => Fetched::failed("status `assigned` carried no `skill_md`"),
         },
         other => Fetched::failed(format!("unknown status `{other}`")),
+    }
+}
+
+/// `skill.{chain_id, version_id}` and `resolved_at` (D2). Both ids or none: a
+/// record with half an identity would be stored with `skill_unresolved` and
+/// read as ENGRAM's fault rather than ours.
+fn read_resolved(value: &serde_json::Value) -> Option<ResolvedSkill> {
+    let id = |field: &str| {
+        value
+            .pointer(&format!("/skill/{field}"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    match (id("chain_id"), id("version_id")) {
+        (Some(chain_id), Some(version_id)) => Some(ResolvedSkill {
+            chain_id,
+            version_id,
+            resolved_at: value
+                .get("resolved_at")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        }),
+        _ => None,
     }
 }
 
@@ -1255,10 +1420,7 @@ where
                 // load a skill that is not on disk sends the agent to a
                 // tool call that fails.
                 Ok(path) => {
-                    let installed = InstalledSkill {
-                        directory: skill.directory.clone(),
-                        references: skill.reference_paths(),
-                    };
+                    let installed = installed_from(&skill, &path, fetched.resolved.as_ref());
                     // Item 6: the files are on disk either way. What the
                     // gap decides is whether this agent may work.
                     match gap_trouble(&fetched.unreadable_parts, require_assigned_skill) {
@@ -1679,10 +1841,7 @@ where
             };
             match skill.write_into(&cfg.skills_root) {
                 Ok(path) => {
-                    let installed = InstalledSkill {
-                        directory: skill.directory.clone(),
-                        references: skill.reference_paths(),
-                    };
+                    let installed = installed_from(&skill, &path, fetched.resolved.as_ref());
                     record_installed(installed.clone());
                     match gap_trouble(&fetched.unreadable_parts, require_assigned_skill) {
                         None => {
@@ -1979,6 +2138,9 @@ pub struct InstalledSkill {
     /// Its reference parts, relative to the skill directory. Empty when the
     /// skill is a single file — in which case one `load_skill` gets everything.
     pub references: Vec<String>,
+    /// What a turn record's `skill` carries (D2). `None` when it could not be
+    /// built; the bootstrap does not depend on it.
+    pub skill_ref: Option<SkillRef>,
 }
 
 /// Process-wide, because the fetch happens once at process start and every
@@ -3791,6 +3953,7 @@ mod policy_tests {
         let skill = InstalledSkill {
             directory: "buzz-coder".into(),
             references: vec![],
+            skill_ref: None,
         };
         assert_eq!(
             doorbell_receipt(&RefetchOutcome::Swapped {
@@ -3817,6 +3980,7 @@ mod policy_tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_revision_swaps_the_directory() {
+        let _serialised = state_test_guard_async().await;
         let root = tempfile::tempdir().unwrap();
         let cfg = test_cfg(root.path(), false);
         let script = Script::new(vec![assigned()]);
@@ -3832,6 +3996,8 @@ mod policy_tests {
             other => panic!("expected Swapped, got {other:?}"),
         }
         assert!(root.path().join("buzz-coder/SKILL.md").is_file());
+        clear_installed();
+        clear_trouble();
     }
 
     #[tokio::test(start_paused = true)]
@@ -4308,6 +4474,7 @@ mod policy_tests {
             skill_md: None,
             require_assigned_skill: None,
             unreadable_parts: Vec::new(),
+            resolved: None,
         }]);
         match fetch_with_policy(&cfg, &mut RequirementCache::new(), || async {
             script.next()
@@ -4331,6 +4498,7 @@ mod bootstrap_tests {
         InstalledSkill {
             directory: skill.directory.clone(),
             references: skill.reference_paths(),
+            skill_ref: None,
         }
     }
 
@@ -4378,6 +4546,7 @@ mod bootstrap_tests {
         let installed = InstalledSkill {
             directory: skill.directory.clone(),
             references: skill.reference_paths(),
+            skill_ref: None,
         };
         assert!(installed.references.is_empty());
         let text = bootstrap_text(Some(&installed)).unwrap();
@@ -4766,5 +4935,223 @@ mod announcement_tests {
         clear_trouble();
         told_slot().lock().unwrap().remove(a);
         told_slot().lock().unwrap().remove(b);
+    }
+}
+
+#[cfg(test)]
+mod skill_ref_tests {
+    //! D2: the turn record's `skill` — the root's ids from the response, and a
+    //! digest of what landed on disk.
+    use super::*;
+
+    fn assigned() -> Fetched {
+        interpret_payload(include_str!("../tests/fixtures/assigned_split.json"))
+    }
+
+    fn test_cfg(root: &Path) -> SkillFetchConfig {
+        SkillFetchConfig {
+            url: "http://unused".into(),
+            pat: "unused".into(),
+            project: "project:test".into(),
+            skills_root: root.to_path_buf(),
+            require_assigned_skill: false,
+        }
+    }
+
+    #[test]
+    fn the_ids_come_from_their_own_fields_and_are_not_inferred() {
+        // The split fixture is a live DEV capture of a REVISED chain, so the
+        // two ids differ. A reader that copied one into the other passes a
+        // single-file fixture (where they coincide) and fails here.
+        let r = assigned().resolved.expect("the fixture carries both ids");
+        assert_eq!(r.chain_id, "1bdeab6e-2088-4e54-bced-b76b98fdb600");
+        assert_eq!(r.version_id, "9ca46238-1750-4348-9226-0034fad966f2");
+        assert_ne!(r.chain_id, r.version_id);
+    }
+
+    #[test]
+    fn both_ids_or_none() {
+        let read = |skill: serde_json::Value| {
+            read_resolved(&serde_json::json!({"status": "assigned", "skill": skill}))
+        };
+        assert!(read(serde_json::json!({"chain_id": "c"})).is_none());
+        assert!(read(serde_json::json!({"version_id": "v"})).is_none());
+        assert!(read(serde_json::json!({"chain_id": "", "version_id": "v"})).is_none());
+        assert!(read(serde_json::json!({"chain_id": 1, "version_id": "v"})).is_none());
+        assert!(read_resolved(&serde_json::json!({"status": "assigned"})).is_none());
+        let both = read(serde_json::json!({"chain_id": "c", "version_id": "v"})).unwrap();
+        assert_eq!(
+            (both.chain_id.as_str(), both.version_id.as_str()),
+            ("c", "v")
+        );
+        assert_eq!(both.resolved_at, None);
+    }
+
+    #[test]
+    fn resolved_at_is_carried_verbatim() {
+        let r = read_resolved(&serde_json::json!({
+            "skill": {"chain_id": "c", "version_id": "v"},
+            "resolved_at": "2026-11-08T21:07:52.033087+00:00",
+        }))
+        .unwrap();
+        assert_eq!(
+            r.resolved_at.as_deref(),
+            Some("2026-11-08T21:07:52.033087+00:00")
+        );
+    }
+
+    #[test]
+    fn no_ids_on_any_other_status() {
+        for status in ["no_skill_assigned", "skills_disabled"] {
+            let f = interpret_payload(
+                &serde_json::json!({"status": status, "skill": {"chain_id": "c", "version_id": "v"}})
+                    .to_string(),
+            );
+            assert!(f.resolved.is_none(), "{status}");
+        }
+    }
+
+    #[test]
+    fn the_digest_is_read_back_from_disk() {
+        let root = tempfile::tempdir().unwrap();
+        let skill = assigned().skill_md.unwrap();
+        let path = skill.write_into(root.path()).unwrap();
+        let first = directory_digest(&path).unwrap();
+        assert!(
+            first.starts_with("sha256:") && first.len() == 7 + 64,
+            "{first}"
+        );
+        assert_eq!(directory_digest(&path).unwrap(), first, "deterministic");
+
+        // The same payload in a different root hashes the same: the root path
+        // is not part of the digest.
+        let other = tempfile::tempdir().unwrap();
+        let path2 = skill.write_into(other.path()).unwrap();
+        assert_eq!(directory_digest(&path2).unwrap(), first);
+
+        // A change made on disk after the write changes it. This is the point
+        // of reading back: the digest describes what the agent can read.
+        fs::write(path.join("references/stray.md"), "x").unwrap();
+        assert_ne!(directory_digest(&path).unwrap(), first);
+    }
+
+    #[test]
+    fn moving_bytes_across_a_file_boundary_changes_the_digest() {
+        let a = tempfile::tempdir().unwrap();
+        fs::write(a.path().join("a"), "bc").unwrap();
+        let b = tempfile::tempdir().unwrap();
+        fs::write(b.path().join("ab"), "c").unwrap();
+        assert_ne!(
+            directory_digest(a.path()).unwrap(),
+            directory_digest(b.path()).unwrap()
+        );
+    }
+
+    #[test]
+    fn fetched_at_falls_back_to_the_install_time() {
+        let root = tempfile::tempdir().unwrap();
+        let skill = assigned().skill_md.unwrap();
+        let path = skill.write_into(root.path()).unwrap();
+
+        let with = ResolvedSkill {
+            chain_id: "c".into(),
+            version_id: "v".into(),
+            resolved_at: Some("2026-11-08T21:07:52.033087+00:00".into()),
+        };
+        let r = installed_from(&skill, &path, Some(&with))
+            .skill_ref
+            .unwrap();
+        assert_eq!(r.fetched_at, "2026-11-08T21:07:52.033087+00:00");
+
+        let without = ResolvedSkill {
+            resolved_at: None,
+            ..with
+        };
+        let r = installed_from(&skill, &path, Some(&without))
+            .skill_ref
+            .unwrap();
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&r.fetched_at).is_ok(),
+            "{}",
+            r.fetched_at
+        );
+    }
+
+    #[test]
+    fn no_ids_installs_the_skill_but_builds_no_ref() {
+        let root = tempfile::tempdir().unwrap();
+        let skill = assigned().skill_md.unwrap();
+        let path = skill.write_into(root.path()).unwrap();
+        let installed = installed_from(&skill, &path, None);
+        assert!(installed.skill_ref.is_none());
+        assert_eq!(
+            installed.references.len(),
+            7,
+            "the bootstrap must not depend on D2"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_install_records_the_ids_and_the_on_disk_digest() {
+        let _serialised = state_test_guard_async().await;
+        let root = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(root.path());
+        let mut once = Some(assigned());
+        let out = fetch_with_policy(&cfg, &mut RequirementCache::new(), || {
+            let f = once.take().expect("a success must not retry");
+            async move { f }
+        })
+        .await;
+        let StartupOutcome::Installed { path, skill } = out else {
+            panic!("expected Installed, got {out:?}");
+        };
+        let r = skill.skill_ref.expect("ids present, so a ref");
+        assert_eq!(r.chain_id, "1bdeab6e-2088-4e54-bced-b76b98fdb600");
+        assert_eq!(r.version_id, "9ca46238-1750-4348-9226-0034fad966f2");
+        assert_eq!(r.digest, directory_digest(&path).unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refetch_moves_both_the_version_and_the_digest() {
+        let _serialised = state_test_guard_async().await;
+        let root = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(root.path());
+
+        let mut first = Some(assigned());
+        let before = match fetch_with_policy(&cfg, &mut RequirementCache::new(), || {
+            let f = first.take().unwrap();
+            async move { f }
+        })
+        .await
+        {
+            StartupOutcome::Installed { skill, .. } => skill.skill_ref.unwrap(),
+            other => panic!("{other:?}"),
+        };
+
+        // A revision: new head id, one changed byte in the root file.
+        let mut revised = assigned();
+        revised.resolved.as_mut().unwrap().version_id = "revised-head".into();
+        revised.skill_md.as_mut().unwrap().files[0]
+            .content
+            .push('\n');
+        let mut second = Some(revised);
+        let after = match refetch_with_policy(&cfg, &mut RequirementCache::new(), || {
+            let f = second.take().unwrap();
+            async move { f }
+        })
+        .await
+        {
+            RefetchOutcome::Swapped { skill, .. } => skill.skill_ref.unwrap(),
+            other => panic!("{other:?}"),
+        };
+
+        assert_eq!(
+            after.chain_id, before.chain_id,
+            "the chain survives a revision"
+        );
+        assert_eq!(after.version_id, "revised-head");
+        assert_ne!(after.digest, before.digest);
+        clear_installed();
+        clear_trouble();
     }
 }

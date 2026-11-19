@@ -79,6 +79,10 @@ pub(crate) struct TurnObservation {
     /// Every `buzz messages send` the relay accepted, in completion order
     /// (D1h). The record's `delivered` is derived from this.
     pub sends: Vec<AcceptedSend>,
+    /// The installed skill as it stood when the turn BEGAN (D2). Snapshotted
+    /// then, not at the end, so a refetch that lands while this turn runs in
+    /// another channel is reported by the next turn rather than this one.
+    pub skill: Option<crate::engram_skill::SkillRef>,
 }
 
 /// One accepted `buzz messages send`, read from the shell call's own command
@@ -173,6 +177,14 @@ impl TurnRecorder {
             index: HashMap::new(),
             send_commands: HashMap::new(),
         });
+    }
+
+    /// Attach the skill in effect at the start of the current turn (D2). A
+    /// no-op outside a turn.
+    pub fn set_skill(&mut self, skill: Option<crate::engram_skill::SkillRef>) {
+        if let Some(cur) = self.current.as_mut() {
+            cur.obs.skill = skill;
+        }
     }
 
     /// Record the raw `stopReason` of the turn's `session/prompt` response.
@@ -799,5 +811,28 @@ mod tests {
         push_capped(&mut buf, "é", &mut capped); // two bytes, one of room
         assert!(capped);
         assert_eq!(buf.len(), RAW_FIELD_CAP - 1);
+    }
+
+    #[test]
+    fn the_skill_is_per_turn_and_set_only_inside_one() {
+        let skill = crate::engram_skill::SkillRef {
+            chain_id: "c".into(),
+            version_id: "v1".into(),
+            fetched_at: "t".into(),
+            digest: "sha256:x".into(),
+        };
+        let mut rec = TurnRecorder::default();
+        // Outside a turn: a no-op, not a value carried into the next one.
+        rec.set_skill(Some(skill.clone()));
+        rec.begin_turn("s");
+        assert_eq!(rec.take().unwrap().skill, None);
+
+        rec.begin_turn("s");
+        rec.set_skill(Some(skill.clone()));
+        assert_eq!(rec.take().unwrap().skill, Some(skill));
+
+        // A new turn starts clean: the snapshot is retaken, never inherited.
+        rec.begin_turn("s");
+        assert_eq!(rec.take().unwrap().skill, None);
     }
 }

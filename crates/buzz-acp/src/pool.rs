@@ -11694,6 +11694,11 @@ done"#
     #[tokio::test]
     async fn session_new_sends_policy_specific_base_and_scope_specific_title() {
         use crate::scope::SessionPolicy;
+        // The system prompt carries the skill bootstrap, which is read from
+        // process-wide state that the skill tests write. Hold their guard and
+        // start from a clean slot, or this test sees another test's skill.
+        let _serialised = crate::engram_skill::state_test_guard_async().await;
+        crate::engram_skill::clear_installed();
 
         let channel_id = Uuid::new_v4();
         let thread_a = SessionScope::Thread {

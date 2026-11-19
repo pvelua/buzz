@@ -885,6 +885,10 @@ impl AcpClient {
         self.goose_usage.begin_turn(session_id);
         self.standard_usage.begin_turn(session_id);
         self.turn_record.begin_turn(session_id);
+        // D2: the skill this turn starts under. Read here, before the prompt
+        // is sent, from the same slot the bootstrap reads.
+        self.turn_record
+            .set_skill(crate::engram_skill::installed_skill().and_then(|s| s.skill_ref));
 
         self.last_prompt_id = Some(self.next_id);
         let id = self.next_id;

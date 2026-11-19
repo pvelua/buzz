@@ -141,8 +141,9 @@ fn rfc3339(t: chrono::DateTime<chrono::Utc>) -> String {
 ///   session's first turn because Goose's first `usage_update` has no cost.
 /// - **`stop_reason`** is the raw value from the recorder, verbatim.
 /// - **`delivered`** from the accepted sends, see [`delivered`].
-/// - **Not built here:** `skill` (D2), `self_assessment` (D3). Absent rather
-///   than null, since each is optional.
+/// - **`skill`** (D2) is the installed skill as the turn began, present only
+///   when one was installed with its ids; absent otherwise, never null.
+/// - **Not built here:** `self_assessment` (D3). Absent rather than null.
 pub(crate) fn build_record(
     ctx: &TurnContext,
     obs: &TurnObservation,
@@ -200,6 +201,9 @@ pub(crate) fn build_record(
             "tool_results": obs.tool_results,
         },
     });
+    if let Some(skill) = &obs.skill {
+        record["skill"] = skill.to_json();
+    }
     if let Some(delivered) = delivered(ctx, obs) {
         record["delivered"] = delivered;
     }
@@ -451,6 +455,33 @@ mod tests {
     }
 
     #[test]
+    fn an_installed_skill_is_sent_in_the_api_note_shape() {
+        let mut obs = observed();
+        obs.skill = Some(crate::engram_skill::SkillRef {
+            chain_id: "1bdeab6e-2088-4e54-bced-b76b98fdb600".into(),
+            version_id: "9ca46238-1750-4348-9226-0034fad966f2".into(),
+            fetched_at: "2026-11-08T21:07:52.033087+00:00".into(),
+            digest: format!("sha256:{}", "0".repeat(64)),
+        });
+        let v = build_record(&ctx(), &obs, None);
+        assert_eq!(
+            v["skill"],
+            json!({
+                "chain_id": "1bdeab6e-2088-4e54-bced-b76b98fdb600",
+                "version_id": "9ca46238-1750-4348-9226-0034fad966f2",
+                "fetched_at": "2026-11-08T21:07:52.033087+00:00",
+                "digest": format!("sha256:{}", "0".repeat(64)),
+            })
+        );
+    }
+
+    #[test]
+    fn no_installed_skill_means_no_skill_field_not_null() {
+        let v = build_record(&ctx(), &observed(), None);
+        assert!(v.get("skill").is_none());
+    }
+
+    #[test]
     fn a_turn_with_no_accepted_send_has_no_delivered() {
         let v = build_record(&ctx(), &observed(), None);
         assert!(v.get("delivered").is_none());
@@ -489,7 +520,10 @@ mod tests {
         );
         assert_eq!(v["raw"]["channel_text"], "done");
         for absent in ["skill", "self_assessment", "delivered", "user_id"] {
-            assert!(v.get(absent).is_none(), "{absent} must be absent in D1b");
+            assert!(
+                v.get(absent).is_none(),
+                "{absent} must be absent when not observed"
+            );
         }
     }
 
