@@ -88,6 +88,9 @@ pub(crate) struct TurnContext {
     pub trigger_event_id: Option<String>,
     pub channel_id: Option<String>,
     pub outcome: TurnOutcome,
+    /// `raw.trigger_text`: the trigger message's text as received, present
+    /// only when the agent's switch is on and the turn had a trigger.
+    pub trigger_text: Option<String>,
 }
 
 /// A turn record serialised once. The sender holds these bytes until
@@ -205,6 +208,9 @@ pub(crate) fn build_record(
             "tool_results": obs.tool_results,
         },
     });
+    if let Some(text) = &ctx.trigger_text {
+        record["raw"]["trigger_text"] = serde_json::Value::String(text.clone());
+    }
     if let Some(skill) = &obs.skill {
         record["skill"] = skill.to_json();
     }
@@ -262,6 +268,9 @@ pub(crate) struct TurnFacts {
     pub trigger_event_id: Option<String>,
     pub episode_ref: Option<String>,
     pub channel_id: Option<String>,
+    /// The `content` of the event `trigger_event_id` names, verbatim. Always
+    /// captured; whether it is SENT is the agent's switch.
+    pub trigger_text: Option<String>,
 }
 
 /// What the harness knows about itself for this record.
@@ -272,6 +281,8 @@ pub(crate) struct HarnessFacts<'a> {
     pub acp_protocol_version: Option<u64>,
     /// Goose's `agentInfo.version` from `initialize`.
     pub agent_version: Option<&'a str>,
+    /// Whether `raw.trigger_text` may be sent (ENGRAM v1.22.1 or later).
+    pub send_trigger_text: bool,
 }
 
 /// One turn's record, serialised once. The single call site is the pool's
@@ -296,6 +307,10 @@ pub(crate) fn record_for_turn(
         trigger_event_id: facts.trigger_event_id.clone(),
         channel_id: facts.channel_id.clone(),
         outcome,
+        trigger_text: harness
+            .send_trigger_text
+            .then(|| facts.trigger_text.clone())
+            .flatten(),
     };
     serialize_record(&build_record(&ctx, obs, usage))
 }
@@ -319,12 +334,14 @@ mod tests {
             trigger_event_id: Some("cd".repeat(32)),
             episode_ref: Some("ef".repeat(32)),
             channel_id: Some("7dfc1946-10d3-4497-8080-94db7575fc70".into()),
+            trigger_text: Some("@BE Coder please fix the date".into()),
         };
         let harness = HarnessFacts {
             project: "project:b5cb944650f21b76",
             build: Some("1.4.0"),
             acp_protocol_version: Some(1),
             agent_version: Some("1.57.0"),
+            send_trigger_text: false,
         };
         let bytes = record_for_turn(&harness, &facts, &obs, None, TurnOutcome::Answered, ended);
         let v: serde_json::Value = serde_json::from_slice(bytes.as_bytes()).unwrap();
@@ -389,6 +406,7 @@ mod tests {
             trigger_event_id: Some("ab".repeat(32)),
             channel_id: Some("7dfc1946-10d3-4497-8080-94db7575fc70".into()),
             outcome: TurnOutcome::Answered,
+            trigger_text: None,
         }
     }
 
@@ -565,6 +583,74 @@ mod tests {
         obs.final_text = "And then one more thing.".into();
         let v = build_record(&ctx(), &obs, None);
         assert!(v.get("self_assessment").is_none());
+    }
+
+    // ── raw.trigger_text ────────────────────────────────────────────────
+
+    fn facts(text: Option<&str>) -> TurnFacts {
+        TurnFacts {
+            trigger_event_id: Some("cd".repeat(32)),
+            episode_ref: None,
+            channel_id: Some(OWN.into()),
+            trigger_text: text.map(str::to_string),
+        }
+    }
+
+    fn harness(send: bool) -> HarnessFacts<'static> {
+        HarnessFacts {
+            project: "project:b5cb944650f21b76",
+            build: Some("1.4.2"),
+            acp_protocol_version: Some(1),
+            agent_version: Some("1.57.0"),
+            send_trigger_text: send,
+        }
+    }
+
+    fn sent(h: &HarnessFacts<'_>, f: &TurnFacts) -> serde_json::Value {
+        let bytes = record_for_turn(
+            h,
+            f,
+            &observed(),
+            None,
+            TurnOutcome::Answered,
+            chrono::Utc::now(),
+        );
+        serde_json::from_slice(bytes.as_bytes()).unwrap()
+    }
+
+    /// Sent verbatim, in `raw` (the blob) and nowhere else in the record.
+    #[test]
+    fn trigger_text_goes_to_raw_verbatim_when_the_switch_is_on() {
+        let text = "@BE Coder no -- the date is 2026-11-19, not 11-18.\nPlease fix it.";
+        let v = sent(&harness(true), &facts(Some(text)));
+        assert_eq!(v["raw"]["trigger_text"], text);
+        let top: Vec<&String> = v.as_object().unwrap().keys().collect();
+        assert!(!top.iter().any(|k| k.contains("trigger_text")), "{top:?}");
+        assert_eq!(
+            v["raw"]["channel_text"], "done",
+            "the other raw fields are untouched"
+        );
+    }
+
+    /// The negative control: OFF is the default and sends nothing, so an
+    /// ENGRAM older than v1.22.1 never silently drops a field we think we sent.
+    #[test]
+    fn trigger_text_is_absent_when_the_switch_is_off() {
+        let v = sent(&harness(false), &facts(Some("please fix it")));
+        assert!(v["raw"].get("trigger_text").is_none());
+    }
+
+    /// No trigger (a heartbeat turn) means no field, never a guessed "".
+    /// An empty message is a real message and is sent as received.
+    #[test]
+    fn no_trigger_means_no_field_and_an_empty_message_is_sent_as_received() {
+        assert!(sent(&harness(true), &facts(None))["raw"]
+            .get("trigger_text")
+            .is_none());
+        assert_eq!(
+            sent(&harness(true), &facts(Some("")))["raw"]["trigger_text"],
+            ""
+        );
     }
 
     #[test]

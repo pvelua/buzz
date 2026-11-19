@@ -5326,6 +5326,9 @@ fn turn_facts_for(
         trigger_event_id,
         episode_ref,
         channel_id: channel_id.map(|c| c.to_string()),
+        // The SAME event as `trigger_event_id`, so the text and the id never
+        // describe two different messages in a batched turn.
+        trigger_text: last.map(|be| be.event.content.clone()),
     }
 }
 
@@ -5362,6 +5365,7 @@ async fn finish_turn(
             build: observation.build.as_deref(),
             acp_protocol_version,
             agent_version,
+            send_trigger_text: observation.trigger_text,
         };
         let bytes = crate::turn_payload::record_for_turn(
             &harness,
@@ -8500,6 +8504,7 @@ done"#;
             sender: crate::turn_sender::TurnSender::spawn(config).unwrap(),
             project: "project:b5cb944650f21b76".into(),
             build: Some("1.4.0".into()),
+            trigger_text: false,
         };
         let (trigger, channel_id) = run_one(Some(observation)).await;
         for _ in 0..200 {
@@ -8566,6 +8571,37 @@ done"#;
         let batch = batch_with_scope(SessionScope::Conversation { channel_id: ch }, ev);
         let facts = turn_facts_for(Some(&batch), Some(ch));
         assert_eq!(facts.episode_ref.as_deref(), Some(trigger.as_str()));
+    }
+
+    /// A batched turn: the text is the NEWEST event's, the same event
+    /// `trigger_event_id` names, verbatim -- never the first one's, and never
+    /// the batch joined together.
+    #[test]
+    fn turn_facts_take_the_trigger_text_from_the_same_event_as_the_id() {
+        let ch = Uuid::new_v4();
+        let keys = Keys::generate();
+        let first = EventBuilder::new(Kind::Custom(9), "@BE Coder write the report")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let newest = EventBuilder::new(
+            Kind::Custom(9),
+            "@BE Coder no -- the date is wrong.\nFix it.",
+        )
+        .sign_with_keys(&keys)
+        .unwrap();
+        let newest_id = newest.id.to_hex();
+        let mut batch = batch_with_scope(SessionScope::Conversation { channel_id: ch }, first);
+        batch.events.push(crate::queue::BatchEvent {
+            event: newest,
+            prompt_tag: "test".into(),
+            received_at: std::time::Instant::now(),
+        });
+        let facts = turn_facts_for(Some(&batch), Some(ch));
+        assert_eq!(facts.trigger_event_id.as_deref(), Some(newest_id.as_str()));
+        assert_eq!(
+            facts.trigger_text.as_deref(),
+            Some("@BE Coder no -- the date is wrong.\nFix it.")
+        );
     }
 
     #[test]

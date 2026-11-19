@@ -63,6 +63,13 @@ pub(crate) struct ObservationConfig {
     pub endpoint: String,
     pat: String,
     pub project: String,
+    /// `ENGRAM_TRIGGER_TEXT`: also send the trigger message's text as
+    /// `raw.trigger_text`. Default OFF, and separate from `ENGRAM_OBSERVE`,
+    /// because ENGRAM accepts the field only from v1.22.1 and an older ENGRAM
+    /// drops it silently (API note `895b40ca`); it is also the one bounded
+    /// copy of conversation into ENGRAM (seam contract v1.18 §1), so it is
+    /// switched on per stack, deliberately.
+    pub trigger_text: bool,
 }
 
 impl std::fmt::Debug for ObservationConfig {
@@ -72,6 +79,7 @@ impl std::fmt::Debug for ObservationConfig {
             .field("endpoint", &self.endpoint)
             .field("pat", &"<redacted>")
             .field("project", &self.project)
+            .field("trigger_text", &self.trigger_text)
             .finish()
     }
 }
@@ -115,10 +123,18 @@ impl ObservationConfig {
         let project = text("ENGRAM_PROJECT").ok_or(
             "ENGRAM_OBSERVE is on but ENGRAM_PROJECT is unset or empty: no project, no record",
         )?;
+        let trigger_text = matches!(
+            text("ENGRAM_TRIGGER_TEXT")
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes" | "on"
+        );
         Ok(Some(Self {
             endpoint,
             pat,
             project,
+            trigger_text,
         }))
     }
 }
@@ -253,6 +269,8 @@ pub(crate) struct Observation {
     /// From `BUZZ_BUILD`, which the image bakes in (D1f); `None` is written
     /// `unknown`, never guessed.
     pub build: Option<String>,
+    /// Send `raw.trigger_text` (see [`ObservationConfig::trigger_text`]).
+    pub trigger_text: bool,
 }
 
 impl Observation {
@@ -271,6 +289,7 @@ impl Observation {
         };
         let project = config.project.clone();
         let endpoint = config.endpoint.clone();
+        let trigger_text = config.trigger_text;
         let sender = match TurnSender::spawn(config) {
             Ok(sender) => sender,
             Err(e) => {
@@ -283,13 +302,15 @@ impl Observation {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
         tracing::info!(
-            "turn observation: enabled, endpoint={endpoint} project={project} build={}",
-            build.as_deref().unwrap_or("unknown")
+            "turn observation: enabled, endpoint={endpoint} project={project} build={} trigger_text={}",
+            build.as_deref().unwrap_or("unknown"),
+            if trigger_text { "on" } else { "off" }
         );
         Some(Self {
             sender,
             project,
             build,
+            trigger_text,
         })
     }
 }
@@ -450,6 +471,34 @@ mod tests {
         assert_eq!(cfg.project, "project:b5cb944650f21b76");
     }
 
+    /// `raw.trigger_text` is OFF unless asked for, whatever `ENGRAM_OBSERVE`
+    /// says; on accepts the same spellings as `ENGRAM_OBSERVE`.
+    #[test]
+    fn trigger_text_is_off_by_default_and_on_only_when_asked() {
+        let base = [
+            ("ENGRAM_OBSERVE", "1"),
+            ("ENGRAM_MCP_URL", "https://e.example/mcp/"),
+            ("ENGRAM_PAT", "pat"),
+            ("ENGRAM_PROJECT", "project:x"),
+        ];
+        let with = |v: Option<&str>| {
+            let mut pairs = base.to_vec();
+            if let Some(v) = v {
+                pairs.push(("ENGRAM_TRIGGER_TEXT", v));
+            }
+            ObservationConfig::from_lookup(lookup(&pairs))
+                .unwrap()
+                .unwrap()
+                .trigger_text
+        };
+        assert!(!with(None));
+        assert!(!with(Some("")));
+        assert!(!with(Some("0")));
+        assert!(!with(Some("off")));
+        assert!(with(Some("1")));
+        assert!(with(Some("ON")));
+    }
+
     #[test]
     fn an_explicit_api_url_keeps_its_path_prefix() {
         assert_eq!(
@@ -604,6 +653,7 @@ mod tests {
             endpoint: format!("{url}/api/agent-turns"),
             pat: "engram_pat_test".into(),
             project: "project:x".into(),
+            trigger_text: false,
         }
     }
 
