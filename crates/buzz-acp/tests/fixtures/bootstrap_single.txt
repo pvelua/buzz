@@ -1,0 +1,2 @@
+Before you do anything else, load your assigned skill and follow it, on every new task, even one that looks simple enough to answer without it. It holds the rules for your role on this deployment. The skills list further down says to load a skill "when it can help"; for this one skill that does not apply: always load it first.
+- load_skill(name: "{dir}")
