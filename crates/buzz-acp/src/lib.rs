@@ -4776,10 +4776,22 @@ fn dispatch_pending(
 /// drop a user message, which is worse than a false negative (extra retries on
 /// an auth error). Both patterns are therefore chosen for high precision.
 fn is_auth_error(error: &acp::AcpError) -> bool {
-    let acp::AcpError::AgentError { message, .. } = error else {
+    let acp::AcpError::AgentError { code, message } = error else {
         return false;
     };
-    message.contains("Re-authenticate") || message.contains("API Error: 401")
+    message.contains("Re-authenticate")
+        || message.contains("API Error: 401")
+        || is_acp_auth_required(*code, message)
+}
+
+/// ACP's own `auth_required` error: code `-32000` AND the message
+/// `Authentication required`, both required. Goose 1.57.0 sends exactly this
+/// for any provider's authentication failure (`acp/server.rs:1556`, from
+/// `MessageErrorKind::Authentication`), measured on DEV 2026-11-19 with an
+/// invalid Anthropic key. The code alone is not enough: `-32000` is also the
+/// generic server-error code, and this crate defaults a missing code to it.
+fn is_acp_auth_required(code: i64, message: &str) -> bool {
+    code == -32000 && message.trim() == "Authentication required"
 }
 
 /// Spawn a task that posts a user-visible failure notice to the relay.
@@ -4942,18 +4954,21 @@ fn handle_prompt_result(
                     .to_string();
                 spawn_failure_notice(rest_client, &batch, content);
             } else if matches!(&result.outcome, PromptOutcome::Error(e) if is_auth_error(e)) {
-                // Auth errors are non-retryable: the token won't self-repair
-                // between retries, so requeueing only wastes attempt slots and
-                // delays the visible failure. Dead-letter immediately and tell
-                // the user to re-authenticate the CLI.
+                // Auth errors are non-retryable: the token or key won't
+                // self-repair between retries, so requeueing only wastes
+                // attempt slots, delays the visible failure, and records a
+                // fresh error turn per attempt (measured on DEV 2026-11-19: 4
+                // turns from one message before this matched ACP's own
+                // `auth_required`). Dead-letter immediately.
                 tracing::warn!(
                     channel_id = %batch.channel_id,
                     events = batch.events.len(),
                     "dead-lettering batch immediately — non-retryable auth error"
                 );
-                let content = "⚠️ I couldn't process the last request: authentication failed. \
-                    Please re-authenticate the CLI (e.g. run `claude /login` or `codex login`) \
-                    and then re-send."
+                let content = "⚠️ I couldn't process the last request: my model provider \
+                    rejected my credentials. If I sign in through a CLI, re-authenticate it \
+                    (e.g. run `claude /login` or `codex login`); if I use an API key, my operator \
+                    needs to replace it. Then re-send."
                     .to_string();
                 spawn_failure_notice(rest_client, &batch, content);
             } else if let Some(dead) = queue.requeue(batch) {
@@ -11169,6 +11184,35 @@ mod error_outcome_emission_tests {
             is_auth_error(&e),
             "API Error: 401 variant must be classified as auth error"
         );
+    }
+
+    /// Goose 1.57.0's shape for a provider auth failure, as measured on DEV.
+    #[test]
+    fn is_auth_error_matches_acps_own_auth_required() {
+        let e = acp::AcpError::AgentError {
+            code: -32000,
+            message: "Authentication required".to_string(),
+        };
+        assert!(is_auth_error(&e));
+    }
+
+    /// Both halves are required: `-32000` is also the generic server-error
+    /// code (and the default for a missing one), and the same words under
+    /// another code are not ACP's `auth_required`.
+    #[test]
+    fn acp_auth_required_needs_both_the_code_and_the_message() {
+        for (code, message) in [
+            (-32000, "quota exceeded"),
+            (-32000, "retry me"),
+            (-32603, "Authentication required"),
+            (-32000, "Authentication required for this tool"),
+        ] {
+            let e = acp::AcpError::AgentError {
+                code,
+                message: message.to_string(),
+            };
+            assert!(!is_auth_error(&e), "{code} {message:?} must stay retryable");
+        }
     }
 
     #[test]
