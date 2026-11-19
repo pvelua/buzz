@@ -2975,7 +2975,7 @@ pub async fn run_prompt_task(
     // failed or cancelled first turn must not make its retry assume that the
     // provider retained any of that thread's context.
     let mut pending_hydrated_thread_roots = HashSet::new();
-    let prompt_sections: Vec<String> = if let Some(text) = prompt_text {
+    let mut prompt_sections: Vec<String> = if let Some(text) = prompt_text {
         // Heartbeats create their session before this point, so a Goose method-not-found
         // probe has already selected the correct framing for this process.
         //
@@ -3129,6 +3129,10 @@ pub async fn run_prompt_task(
     // own block. Per-section blocks let the observer size trimmer elide a
     // section body in place while every `[Header]` line survives at the head
     // of its own leaf — so the "Prompt context" panel counts every section.
+    // Arm C of the 2026-11-19 skill-load measurement: off unless switched on.
+    if let Some(reminder) = crate::engram_skill::turn_reminder() {
+        prompt_sections.push(reminder);
+    }
     let prompt_blocks: Vec<&str> = match slash_command {
         Some(ref cmd) => std::iter::once(cmd.as_str())
             .chain(prompt_sections.iter().map(String::as_str))

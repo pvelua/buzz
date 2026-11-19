@@ -2228,14 +2228,49 @@ fn mark_fetch_started() {
 /// `"<skill>/references/<part>.md"` form, because the index alone did not get
 /// the parts loaded. Changing this string means re-running the measurement.
 pub fn bootstrap_instruction() -> Option<String> {
-    bootstrap_text(installed_skill().as_ref())
+    bootstrap_text_with(
+        installed_skill().as_ref(),
+        env_switch("ENGRAM_SKILL_BOOTSTRAP_STRONG"),
+    )
+}
+
+/// A DEV measurement switch (2026-11-19), read straight from the process env:
+/// `1`/`true`/`yes`/`on`, anything else off.
+fn env_switch(name: &str) -> bool {
+    matches!(
+        std::env::var(name)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 /// `bootstrap_instruction` over an explicit value, so it is testable without
 /// the process-wide slot.
 pub fn bootstrap_text(skill: Option<&InstalledSkill>) -> Option<String> {
+    bootstrap_text_with(skill, false)
+}
+
+/// ⚠️ MEASUREMENT (arm D, 2026-11-19), off by default. Goose appends its own
+/// `# Skills` list AFTER our whole system prompt, saying "load one when it can
+/// help", and on PROD two of three agents answered a simple question without
+/// loading their single-file skill. The strong wording names that list and
+/// says it does not apply to this skill. Kept beside the measured wording,
+/// not in place of it, until DEV shows which loads more often.
+pub fn bootstrap_text_with(skill: Option<&InstalledSkill>, strong: bool) -> Option<String> {
     let skill = skill?;
     let dir = &skill.directory;
+    if skill.references.is_empty() && strong {
+        return Some(format!(
+            "Before you do anything else, load your assigned skill and follow it, on every new \
+             task, even one that looks simple enough to answer without it. It holds the rules \
+             for your role on this deployment. The skills list further down says to load a skill \
+             \"when it can help\"; for this one skill that does not apply: always load it first.\n\
+             - load_skill(name: \"{dir}\")"
+        ));
+    }
     if skill.references.is_empty() {
         // One file: a single load gets the whole skill, and mentioning
         // references that do not exist would invite a call that fails.
@@ -2256,6 +2291,31 @@ pub fn bootstrap_text(skill: Option<&InstalledSkill>) -> Option<String> {
         out.push_str(&format!("\n- load_skill(name: \"{dir}/{reference}\")"));
     }
     Some(out)
+}
+
+/// ⚠️ MEASUREMENT (arm C, 2026-11-19), off by default: a one-line reminder
+/// appended as the LAST block of every turn's prompt, after Goose's skills
+/// list, while `ENGRAM_SKILL_TURN_REMINDER` is on and a skill is installed.
+pub fn turn_reminder() -> Option<String> {
+    if !env_switch("ENGRAM_SKILL_TURN_REMINDER") {
+        return None;
+    }
+    turn_reminder_text(installed_skill().as_ref())
+}
+
+pub fn turn_reminder_text(skill: Option<&InstalledSkill>) -> Option<String> {
+    let skill = skill?;
+    let dir = &skill.directory;
+    let every = if skill.references.is_empty() {
+        ""
+    } else {
+        " and every reference it lists"
+    };
+    Some(format!(
+        "[Harness reminder] Your assigned skill is `{dir}`. If you have not loaded it in this \
+         conversation yet, call load_skill(name: \"{dir}\"){every} now, before you answer, and \
+         follow it."
+    ))
 }
 
 // ── Option A: the degraded-mode announcement (item 7, §7b) ─────────────────
@@ -4491,6 +4551,43 @@ mod policy_tests {
 mod bootstrap_tests {
     use super::*;
 
+    /// Arm D: only the single-file shape changes, and only when asked; the
+    /// split shape keeps its measured wording either way.
+    #[test]
+    fn the_strong_bootstrap_changes_only_the_single_file_text() {
+        let mut single = split_skill();
+        single.references.clear();
+        let dir = single.directory.clone();
+        let strong = bootstrap_text_with(Some(&single), true).unwrap();
+        assert!(strong.contains("always load it first"), "{strong}");
+        assert!(
+            strong.contains(&format!("load_skill(name: \"{dir}\")")),
+            "{strong}"
+        );
+        assert_ne!(Some(strong), bootstrap_text(Some(&single)));
+        assert_eq!(
+            bootstrap_text_with(Some(&split_skill()), true),
+            bootstrap_text(Some(&split_skill())),
+            "the split wording is the measured one and must not move"
+        );
+    }
+
+    /// Arm C: names the skill, and the references only for a split skill.
+    #[test]
+    fn the_turn_reminder_names_the_skill_and_references_only_when_split() {
+        let split = split_skill();
+        let dir = split.directory.clone();
+        let r = turn_reminder_text(Some(&split)).unwrap();
+        assert!(
+            r.contains(&format!("load_skill(name: \"{dir}\")")) && r.contains("every reference")
+        );
+        let mut single = split_skill();
+        single.references.clear();
+        assert!(!turn_reminder_text(Some(&single))
+            .unwrap()
+            .contains("every reference"));
+    }
+
     fn split_skill() -> InstalledSkill {
         let skill = interpret_payload(include_str!("../tests/fixtures/assigned_split.json"))
             .skill_md
@@ -4524,6 +4621,8 @@ mod bootstrap_tests {
         // disk sends the agent to a tool call that fails, so absence is the
         // correct output when the switch is off or the fetch failed.
         assert_eq!(bootstrap_text(None), None);
+        assert_eq!(bootstrap_text_with(None, true), None);
+        assert_eq!(turn_reminder_text(None), None);
     }
 
     #[test]
